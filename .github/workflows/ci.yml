@@ -1,0 +1,31 @@
+name: CPU verification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the package and common HTTP client
+        run: python -m pip install -e '.[client]'
+      - name: Test protocol, streaming, analysis, budgets, and process cleanup
+        run: python -m unittest discover -s tests -v
+      - name: Print the offline plan
+        run: python -m inference_bench plan
+      - name: Reproduce the synthetic report and bundle
+        run: |
+          python -m inference_bench example --output artifacts/example
+          python -m inference_bench verify-artifacts --input artifacts/example
+          python -m inference_bench analyze --input artifacts/example --output artifacts/example-report --allow-synthetic
+          python -m inference_bench bundle --input artifacts/example --output artifacts/example.tar.gz --allow-synthetic
