@@ -275,11 +275,10 @@ async def _run(
                                 raise StreamError("Response exceeds the trace size limit")
                             for data in decoder.feed(chunk):
                                 trace.accept(data, received)
-                            if record["done_ns"] is not None:
-                                break
-                        if record["done_ns"] is None:
-                            for data in decoder.feed(b"", final=True):
-                                trace.accept(data, time.perf_counter_ns())
+                        # Consume HTTP framing through EOF so the connection can
+                        # return to the pool. E2E still ends at the DONE receipt.
+                        for data in decoder.feed(b"", final=True):
+                            trace.accept(data, time.perf_counter_ns())
                         trace.validate()
                 record["status"] = "success"
             except asyncio.CancelledError:

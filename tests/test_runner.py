@@ -89,6 +89,7 @@ class EngineTests(unittest.TestCase):
         gpu = {"name": "NVIDIA H200", "memory_mib": 143771, "mig_mode": "Disabled"}
         validate_hardware([gpu])
         for devices in ([], [gpu, gpu], [{**gpu, "name": "NVIDIA H100"}],
+                        [{**gpu, "name": "NVIDIA H200 NVL"}],
                         [{**gpu, "memory_mib": 80000}], [{**gpu, "mig_mode": "Enabled"}]):
             with self.assertRaises(ValueError):
                 validate_hardware(devices)

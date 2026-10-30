@@ -19,14 +19,42 @@ def event(value):
 
 @asynccontextmanager
 async def server(mode="normal"):
-    state = {"calls": 0, "active": 0, "maximum": 0, "bodies": []}
+    state = {"calls": 0, "active": 0, "maximum": 0, "bodies": [], "connections": 0}
     tasks = set()
+
+    async def keepalive(reader, writer):
+        while True:
+            headers = (await reader.readuntil(b"\r\n\r\n")).decode("ascii")
+            length = next(
+                int(line.split(":", 1)[1]) for line in headers.split("\r\n")
+                if line.lower().startswith("content-length:")
+            )
+            body = json.loads(await reader.readexactly(length))
+            state["calls"] += 1
+            payload = event({
+                "choices": [{"index": 0, "text": "complete", "finish_reason": "length"}],
+                "usage": {"prompt_tokens": len(body["prompt"]), "completion_tokens": body["max_tokens"]},
+            }) + event("[DONE]")
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Connection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
+            )
+            await writer.drain()
+            # Deliberately separate the terminal SSE event from HTTP completion.
+            await asyncio.sleep(0.01)
+            writer.write(b"0\r\n\r\n")
+            await writer.drain()
 
     async def handle(reader, writer):
         task = asyncio.current_task()
         tasks.add(task)
+        state["connections"] += 1
         active = False
         try:
+            if mode == "keepalive":
+                await keepalive(reader, writer)
+                return
             headers = (await reader.readuntil(b"\r\n\r\n")).decode("ascii")
             length = next(
                 int(line.split(":", 1)[1]) for line in headers.split("\r\n")
@@ -122,6 +150,16 @@ class DecoderTests(unittest.TestCase):
 
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_is_reused_after_done_and_http_completion(self):
+        async with server("keepalive") as (origin, state):
+            result = await run_cell(
+                origin, [prompt(i) for i in range(8)], concurrency=1,
+                output_tokens=3, seed=0, timeout_s=2,
+            )
+        self.assertTrue(result["summary"]["valid"])
+        self.assertEqual(state["calls"], 8)
+        self.assertEqual(state["connections"], 1)
+
     async def test_real_http_concurrency_and_token_usage(self):
         async with server() as (origin, state):
             result = await run_cell(

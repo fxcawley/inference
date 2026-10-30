@@ -43,8 +43,8 @@ def validate_hardware(devices: list[dict]) -> None:
     if len(devices) != 1:
         raise ValueError("Exactly one GPU is required")
     device = devices[0]
-    if "H200" not in device.get("name", ""):
-        raise ValueError("The allocated GPU is not an H200")
+    if device.get("name") not in ("NVIDIA H200", "NVIDIA H200 SXM", "NVIDIA H200 SXM5"):
+        raise ValueError("The allocated GPU is not the expected H200 SXM model")
     if not 130_000 <= device.get("memory_mib", 0) <= 150_000:
         raise ValueError("The allocated GPU does not have the full H200 memory class")
     if device.get("mig_mode") != "Disabled":

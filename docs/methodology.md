@@ -24,6 +24,8 @@ The SSE parser handles fragmented UTF-8, LF/CRLF framing, comments, multiline da
 
 Elapsed timestamps use `perf_counter_ns()`. Headers, first nonempty content, last content, DONE, and errors have separate timestamps. Multiple events delivered together may have identical receipt times.
 
+The client consumes the HTTP response through completion so keep-alive connections return to the pool. E2E still ends at the recorded DONE event; the total request deadline also bounds any remaining transport cleanup.
+
 ## Metrics
 
 | Field | Definition |
