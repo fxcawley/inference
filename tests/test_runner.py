@@ -159,7 +159,7 @@ class ProcessTests(unittest.TestCase):
         def alive():
             try:
                 return "State:\tZ" not in status.read_text()
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return False
 
         until = time.monotonic() + 3
