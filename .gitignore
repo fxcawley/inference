@@ -1,0 +1,38 @@
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test and analysis caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+.cache/
+
+# Local credentials and private configuration
+.env
+.env.*
+!.env.example
+.modal.toml
+secrets/
+*.pem
+*.key
+
+# Downloaded models and raw experiment artifacts
+models/
+checkpoints/
+artifacts/
+results/
+*.safetensors
+*.gguf
+
+# Operating-system files
+.DS_Store
+Thumbs.db
