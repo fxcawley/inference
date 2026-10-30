@@ -3,7 +3,7 @@
 ## Starting point
 
 - Read `README.md` and `docs/megaplan.md` before implementation.
-- This repository initially contains planning and handoff documentation. Do not assume the CLI, configuration files, harness, tests, or measurements described in the plan already exist.
+- The local harness and offline analysis are implemented. Read `docs/runbook.md` for verified capabilities and remaining integration work; the complete megaplan still includes future steps.
 - Follow the user's requested work package. Publishing this plan does not by itself request running the paid GPU campaign.
 - Update the README's implementation status as work becomes complete. Distinguish source inspection, CPU tests, model qualification, and actual measurements.
 

@@ -2,7 +2,7 @@
 
 A planned public comparison of **vLLM and SGLang serving Gemma 4 26B-A4B on Modal**, with a short write-up for [cawley.dev](https://cawley.dev).
 
-**Status: planning and handoff documentation.** The benchmark harness has not been implemented, and no GPU measurements have been collected. The initial repository contains the plan and conventions for continuing the work on another machine.
+**Status: the local harness and offline reporting path are implemented.** CPU tests exercise real loopback HTTP, streaming/token accounting, deterministic prompts, process cleanup, budget recovery, and artifact validation. Engine images, model access, and real GPU behavior remain unqualified; there are no measured engine results yet.
 
 Read the **[full megaplan](docs/megaplan.md)** for the experiment design, implementation work packages, file map, measurement definitions, budget controls, and acceptance criteria.
 
@@ -13,15 +13,46 @@ git clone https://github.com/fxcawley/inference.git
 cd inference
 ```
 
-Only Git is needed to read the plan. The intended implementation uses Python 3.12 on Linux or WSL for a small Modal client. Model downloads, GPU dependencies, and inference run inside Modal; local GPU hardware and a local copy of the model are not required.
+Use Python 3.12 on Linux or WSL. Planning and analysis need only the standard library. Streaming HTTP and its tests use HTTPX; cloud and source-preparation dependencies are separate extras.
 
-Start with [AGENTS.md](AGENTS.md) and [the implementation work packages](docs/megaplan.md#11-ordered-implementation-work-packages).
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[client]'
+python -m inference_bench plan
+python -m unittest discover -s tests -v
+```
 
-Suggested instruction for resuming with a coding assistant:
+To inspect the plan without installing anything:
 
-> Read README.md, AGENTS.md, and docs/megaplan.md. Implement WP0 through WP3: the small controller, reproducible remote image/source preparation, shared benchmark client, artifact handling, budget controls, and CPU tests. Keep the agreed experimental protocol. Report what is implemented and verified, and leave the real-model GPU pilot for WP4. Do not present mocked results as measurements.
+```bash
+PYTHONPATH=src python3 -m inference_bench plan
+```
 
-The commands in the megaplan describe the interface to implement. They are not runnable benchmark commands yet.
+Read [AGENTS.md](AGENTS.md), the [current runbook](docs/runbook.md), and the [measurement definitions](docs/methodology.md). The megaplan describes the full project; the runbook distinguishes working commands from integration work still ahead.
+
+## Exercise the complete offline report path
+
+```bash
+python -m inference_bench example --output artifacts/example
+python -m inference_bench verify-artifacts --input artifacts/example
+python -m inference_bench analyze \
+  --input artifacts/example --output artifacts/example-report --allow-synthetic
+python -m inference_bench bundle \
+  --input artifacts/example --output artifacts/example.tar.gz --allow-synthetic
+```
+
+This produces a checksummed **synthetic fixture**, three labelled SVGs, CSV tables, and `claims.json`. It does not predict either engine's performance. Analysis requires explicit opt-in for synthetic evidence, and synthetic bundles cannot pass the formal measurement gate.
+
+The core includes:
+
+- Strict configuration and deterministic, paired schedules.
+- Exact-length prompt assembly around a supplied tokenizer's chat template.
+- One streaming client with fixed concurrency, absolute request deadlines, authoritative usage checks, and no request retries.
+- Pure latency/throughput calculations and aggregation across independent repetitions.
+- Durable checksums, completion markers, reproducible bundles, and offline SVG reports.
+- Persistent budget reservations, serial-work checks, absolute leases, bounded logs, process-group cleanup, and GPU identity checks.
+- Optional source-preparation functions and a Modal **CPU image inspection** entrypoint.
 
 ## Agreed first study
 
@@ -41,12 +72,18 @@ The full matrix has 72 cells and 256 measured requests per cell. A smaller pilot
 
 Prices checked on October 30, 2026 imply approximately **$5.94/hour** for the proposed H200 container including eight CPU cores and 128 GiB of host RAM. Refresh prices before execution; no runtime or performance result is implied by this estimate.
 
-## First implementation tasks
+## Next integration tasks
 
-1. Finish WP0's Python package, small controller environment, strict configuration validation, and dry-run planning command. Git initialization and this documentation handoff are already done.
-2. Build and inspect the remote images on CPUs. Resolve the model/dataset revisions and dependency locks before GPU work.
-3. Implement and test common request generation, streaming measurements, artifact validation, process cleanup, and budget reservations.
-4. Run the bounded real-model pilot only after those prerequisites are ready and the GPU phase is requested.
+1. Run CPU inspection of the pinned images and establish the shared, isolated Python/client environment with complete dependency locks.
+2. Resolve and download the official model and public dataset inside Modal; inspect the actual tokenizer/template, corpus format, and licenses.
+3. Finish the Modal Volume and GPU orchestration adapter using the tested local runner and ledger. Preserve reservation/call state across failures and machine changes.
+4. Perform real-model conformance checks and the bounded pilot, then freeze the formal protocol and cost forecast.
+
+`python -m inference_bench validate --require-ready` currently fails with the unresolved prerequisites. `modal_app.py` exposes CPU inspection only; remote GPU dispatch is not wired yet. Direct dependency candidates are recorded in [requirements/](requirements/README.md), and the source/client locks intentionally remain unresolved.
+
+Suggested continuation instruction:
+
+> Read AGENTS.md, docs/runbook.md, and docs/megaplan.md. Continue at the external qualification boundary: inspect the pinned engine images on CPUs, resolve source and client locks, then complete the Modal Volume/GPU adapter around the existing runner and budget ledger. Preserve the agreed protocol and $75 gross budget. Qualify the real request semantics before formal measurements.
 
 The site repository is [fxcawley/site](https://github.com/fxcawley/site). Keep the article draft in this repository until measured results are ready: the existing site content loader has no draft filter.
 

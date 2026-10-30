@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inference-bench"
+version = "0.1.0"
+description = "A reproducible, bounded Gemma serving comparison"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+client = ["httpx==0.28.1"]
+modal = ["modal==1.6.3"]
+prepare = ["huggingface-hub==1.5.0"]
+
+[project.scripts]
+inference-bench = "inference_bench.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

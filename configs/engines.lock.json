@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "client": {
+    "implementation": "httpx",
+    "httpx_version": "0.28.1",
+    "python_version": null,
+    "requirements_sha256": null
+  },
+  "engines": {
+    "vllm": {
+      "version": "0.32.0",
+      "image": "vllm/vllm-openai@sha256:6ee133356d49ed24cee03dd0cda3d3980279a11c107ce3e752c89e76540f41c9",
+      "qualification": {"status": "pending", "report_sha256": null}
+    },
+    "sglang": {
+      "version": "0.5.22",
+      "image": "lmsysorg/sglang@sha256:5fc09edb6a0bb1d5b6992b543723c66d08f86d7a507e951e87e0d05db4ac766e",
+      "qualification": {"status": "pending", "report_sha256": null}
+    }
+  }
+}
