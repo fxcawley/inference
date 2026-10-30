@@ -15,7 +15,7 @@ from . import engines
 from .artifacts import seal, write_json, write_jsonl
 from .client import http_client, run_cell
 from .config import Cell, Config
-from .provenance import environment
+from .provenance import environment, source_tree_hash
 from .workloads import sampling_seed, select_prompts
 
 
@@ -186,6 +186,8 @@ async def run_block(
     # Leave shutdown and final artifact writes inside the original reservation.
     deadline = Deadline(deadline_unix - 30)
     deadline.check()
+    if context.get("harness_sha256") != source_tree_hash():
+        raise ValueError("Worker harness source differs from the frozen campaign")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     history = []

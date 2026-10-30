@@ -121,12 +121,13 @@ class AnalysisTests(unittest.TestCase):
     def test_mixed_provenance_is_rejected_even_with_valid_checksums(self):
         path = next(self.input.glob("runs/**/cells/*/manifest.json"))
         metadata = read_json(path)
-        metadata["protocol_sha256"] = "0" * 64
-        write_json(path, metadata)
-        reseal(path.parent)
-        reseal(self.input)
-        with self.assertRaisesRegex(ValueError, "Mixed campaign provenance"):
-            analyze(self.input, self.output, allow_synthetic=True)
+        for field in ("protocol_sha256", "harness_sha256"):
+            with self.subTest(field=field):
+                write_json(path, {**metadata, field: "0" * 64})
+                reseal(path.parent)
+                reseal(self.input)
+                with self.assertRaisesRegex(ValueError, "Mixed campaign provenance"):
+                    analyze(self.input, self.output, allow_synthetic=True)
 
     def test_summary_must_match_raw_records(self):
         path = next(self.input.glob("runs/**/cells/*/summary.json"))

@@ -9,7 +9,10 @@ import tarfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-from .provenance import canonical_json, digest_file, digest_json, measurement_errors, parse_json, read_json
+from .provenance import (
+    canonical_json, digest_file, digest_json, measurement_errors, parse_json, read_json,
+    source_tree_hash,
+)
 
 MARKERS = {"CHECKSUMS.json", "COMPLETE.json"}
 
@@ -105,7 +108,7 @@ def verify(root: Path) -> dict:
 
 IDENTITY_FIELDS = (
     "campaign_id", "evidence_kind", "protocol_sha256", "config_sha256",
-    "sources_sha256", "engines_sha256",
+    "sources_sha256", "engines_sha256", "harness_sha256",
 )
 
 
@@ -115,6 +118,7 @@ def create_campaign(
 ) -> dict:
     if evidence_kind not in ("measurement", "pilot", "synthetic"):
         raise ValueError("Unknown evidence kind")
+    harness = {**harness, "source_sha256": source_tree_hash()}
     if evidence_kind == "measurement":
         problems = measurement_errors(config.data, sources, engines, harness)
         if problems:
@@ -124,6 +128,7 @@ def create_campaign(
     identities = {
         "config_sha256": config.fingerprint,
         "sources_sha256": digest_json(sources), "engines_sha256": digest_json(engines),
+        "harness_sha256": harness["source_sha256"],
     }
     manifest = {
         "schema_version": 1, "campaign_id": campaign_id, "evidence_kind": evidence_kind,

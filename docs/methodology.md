@@ -48,7 +48,7 @@ Latency p50/p95 use linear interpolation within each repetition. Reports then sh
 
 Atomic files, SHA-256 manifests, and completion markers distinguish durable bundles from partial writes. A completion marker proves file integrity, not experimental success; each cell separately records valid/failed/interrupted status.
 
-Analysis verifies the exact file set, protocol/source/image identities, request phases and shapes, and stored summaries against recomputed raw metrics. It rejects mixed campaigns, mismatched summaries, unqualified formal evidence, and missing completion evidence for purportedly successful cells.
+Analysis verifies the exact file set, protocol/source/image/harness identities, request phases and shapes, and stored summaries against recomputed raw metrics. The protocol includes a path-independent hash of the harness's Python source files; the worker checks its actual source before hardware inspection or model startup. Analysis can use a later implementation, but all input cells must identify the same frozen measurement harness. It rejects mixed campaigns, mismatched summaries, unqualified formal evidence, and missing completion evidence for purportedly successful cells.
 
 All planned cells remain represented. Missing cells and failed attempts appear in `failures.csv`. Aggregation selects the first valid attempt, not the fastest, and the figures plot only groups with the complete repetition set. The third figure shows concurrency-labelled throughput/latency points with both horizontal and vertical run ranges.
 

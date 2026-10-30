@@ -29,6 +29,14 @@ def digest_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def source_tree_hash() -> str:
+    """Same identity in a checkout and a container, independent of local paths."""
+    files = sorted(Path(__file__).parent.glob("*.py"))
+    if not files:
+        raise ValueError("Harness source files are unavailable")
+    return digest_json({path.name: digest_file(path) for path in files})
+
+
 def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result = {}
     for key, value in pairs:
@@ -111,6 +119,8 @@ def measurement_errors(configuration: dict, sources: dict, engines: dict, harnes
         errors.append("dataset lock differs from configuration")
     if harness.get("dirty") is not False or not is_hash(harness.get("commit"), 40):
         errors.append("formal measurements require a clean committed harness")
+    if not is_hash(harness.get("source_sha256")):
+        errors.append("harness source identity is missing")
     if experiment["repetitions"] != 3 or experiment["requests_per_cell"] not in (200, 256):
         errors.append("formal protocol requires three repetitions and 200 or 256 requests per cell")
     if experiment["concurrency"] not in ([1, 4, 16], [1, 4, 16, 32]):
@@ -140,8 +150,8 @@ def git_identity(directory: Path) -> dict:
             check=True, capture_output=True, text=True, timeout=10,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return {"commit": None, "dirty": None}
-    return {"commit": commit, "dirty": bool(status)}
+        return {"commit": None, "dirty": None, "source_sha256": source_tree_hash()}
+    return {"commit": commit, "dirty": bool(status), "source_sha256": source_tree_hash()}
 
 
 def environment() -> dict:

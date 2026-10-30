@@ -13,7 +13,7 @@ from inference_bench.artifacts import safe_path, verify
 from inference_bench.budget import BudgetError, Ledger
 from inference_bench.config import Config, load_config
 from inference_bench.engines import command, validate_hardware
-from inference_bench.provenance import read_json
+from inference_bench.provenance import read_json, source_tree_hash
 from inference_bench.runner import Deadline, ProcessGroup, run_block, wait_ready
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -183,6 +183,18 @@ class ProcessTests(unittest.TestCase):
 
 
 class BlockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_changed_harness_is_rejected_before_hardware_or_model_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(ROOT / "configs/benchmark.toml")
+            with patch("inference_bench.runner.engines.inspect_hardware") as probe:
+                with self.assertRaisesRegex(ValueError, "harness source"):
+                    await run_block(
+                        Path(directory) / "block", config, engine="vllm",
+                        model_path="/models/not-loaded", cells=[config.cells()[0]], prompts=[],
+                        context={"harness_sha256": "0" * 64}, deadline_unix=time.time() + 90,
+                    )
+                probe.assert_not_called()
+
     async def test_readiness_deadline_bounds_a_hanging_http_operation(self):
         class Server:
             deadline = Deadline(time.time() + 10)
@@ -206,7 +218,8 @@ class BlockTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ValueError, "wrong GPU"):
                     await run_block(
                         root, config, engine="vllm", model_path="/models/not-loaded",
-                        cells=[config.cells()[0]], prompts=[], context={"attempt": 1},
+                        cells=[config.cells()[0]], prompts=[],
+                        context={"attempt": 1, "harness_sha256": source_tree_hash()},
                         deadline_unix=time.time() + 90,
                     )
             verify(root)

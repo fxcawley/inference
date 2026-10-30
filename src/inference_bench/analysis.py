@@ -10,7 +10,7 @@ from xml.sax.saxutils import escape
 from .artifacts import IDENTITY_FIELDS, atomic_write, read_jsonl, verify, write_json
 from .config import Config
 from .metrics import AGGREGATE_METRICS, aggregate, summarize
-from .provenance import digest_json, measurement_errors, read_json
+from .provenance import digest_json, is_hash, measurement_errors, read_json
 
 
 def _cell_key(row: dict) -> tuple:
@@ -30,6 +30,8 @@ def load_campaign(root: Path, *, allow_synthetic: bool = False) -> tuple[dict, C
     config = Config(read_json(root / "protocol.json"))
     sources = read_json(root / "sources.lock.json")
     engines = read_json(root / "engines.lock.json")
+    if not is_hash(manifest.get("harness", {}).get("source_sha256")):
+        raise ValueError("Campaign lacks its frozen harness source identity")
     if kind == "measurement":
         problems = measurement_errors(config.data, sources, engines, manifest.get("harness", {}))
         if problems:
@@ -38,6 +40,7 @@ def load_campaign(root: Path, *, allow_synthetic: bool = False) -> tuple[dict, C
         "config_sha256": config.fingerprint,
         "sources_sha256": digest_json(sources),
         "engines_sha256": digest_json(engines),
+        "harness_sha256": manifest["harness"]["source_sha256"],
     }
     if any(manifest.get(key) != value for key, value in identities.items()):
         raise ValueError("Campaign source, image, or protocol identity mismatch")
