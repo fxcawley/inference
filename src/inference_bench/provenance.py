@@ -136,6 +136,14 @@ def measurement_errors(configuration: dict, sources: dict, engines: dict, harnes
         or any(shape != expected.get(name) for name, shape in profiles.items())
     ):
         errors.append("formal workload shapes differ from the full/compact protocol")
+    variants = {
+        (frozenset(expected), (1, 4, 16, 32), 256),
+        (frozenset(expected), (1, 4, 16), 256),
+        (frozenset(("short", "prefill")), (1, 4, 16), 256),
+        (frozenset(("short", "prefill")), (1, 4, 16), 200),
+    }
+    if (frozenset(profiles), tuple(experiment["concurrency"]), experiment["requests_per_cell"]) not in variants:
+        errors.append("formal matrix must follow the agreed compact-protocol reduction order")
     return errors
 
 

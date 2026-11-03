@@ -183,6 +183,10 @@ async def run_block(
         raise ValueError("A block must contain cells for one engine")
     if len({c.repetition for c in cells}) != 1:
         raise ValueError("A fresh process is required for each repetition")
+    if len(set(cells)) != len(cells) or not set(cells) <= set(config.cells(phase=phase)):
+        raise ValueError("Block cells differ from the requested phase's schedule")
+    if context.get("evidence_kind") in ("pilot", "measurement") and context["evidence_kind"] != phase:
+        raise ValueError("Block phase differs from its campaign evidence kind")
     # Leave shutdown and final artifact writes inside the original reservation.
     deadline = Deadline(deadline_unix - 30)
     deadline.check()
@@ -194,6 +198,7 @@ async def run_block(
     samples = []
     sampler = None
     outcome = {"status": "started", "error": None, "completed_cells": 0}
+    timing = {"started_ns": time.perf_counter_ns(), "ready_ns": None, "finished_ns": None}
 
     def transition(state: str):
         history.append({"state": state, "unix": time.time()})
@@ -220,6 +225,7 @@ async def run_block(
                 async with http_client(config.experiment["max_running_requests"]) as client:
                     origin = f"http://127.0.0.1:{port}"
                     await wait_ready(client, origin, server, config.experiment["ready_timeout_s"])
+                    timing["ready_ns"] = time.perf_counter_ns()
                     transition("ready")
                     sampler = asyncio.create_task(_sample_gpu(samples))
                     for cell in cells:
@@ -230,18 +236,16 @@ async def run_block(
                         write_json(cell_dir / "manifest.json", metadata)
                         write_json(cell_dir / "status.json", {"status": "interrupted"})
                         shape = config.profiles[cell.profile]
-                        warmup_n = max(
-                            config.experiment["warmup_min"],
-                            config.experiment["warmup_waves"] * cell.concurrency,
-                        )
+                        warmup_n = config.warmup_count(cell.concurrency)
+                        warmup_phase = "pilot_warmup" if phase == "pilot" else "warmup"
                         warmup = select_prompts(
-                            prompts, cell.profile, cell.repetition, "warmup", warmup_n,
+                            prompts, cell.profile, cell.repetition, warmup_phase, warmup_n,
                         )
                         transition("warming")
                         warmed = await run_cell(
                             origin, warmup, concurrency=cell.concurrency,
                             output_tokens=shape["output_tokens"],
-                            seed=sampling_seed(config.experiment["seed"], cell.profile, cell.repetition, "warmup"),
+                            seed=sampling_seed(config.experiment["seed"], cell.profile, cell.repetition, warmup_phase),
                             timeout_s=config.experiment["request_timeout_s"], phase="warmup",
                             context=metadata, client=client,
                         )
@@ -249,8 +253,8 @@ async def run_block(
                         if not warmed["summary"]["valid"]:
                             raise RuntimeError("Warmup failed; measured work was not started")
                         measured = select_prompts(
-                            prompts, cell.profile, cell.repetition, "measurement",
-                            config.experiment["requests_per_cell"],
+                            prompts, cell.profile, cell.repetition, phase,
+                            config.request_count(cell.concurrency, phase=phase),
                         )
                         transition("measuring")
                         result = await run_cell(
@@ -285,5 +289,7 @@ async def run_block(
             await asyncio.gather(sampler, return_exceptions=True)
         write_jsonl(directory / "gpu-host-samples.jsonl.gz", samples)
         transition(outcome["status"])
+        timing["finished_ns"] = time.perf_counter_ns()
+        write_json(directory / "timing.json", timing)
         seal(directory)
     return outcome

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+import math
 import time
 import uuid
 from contextlib import contextmanager
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .artifacts import write_json
@@ -53,13 +54,52 @@ class Ledger:
             }
         data = read_json(self.path)
         if (
-            data.get("schema_version") != 1
+            not isinstance(data, dict)
+            or type(data.get("schema_version")) is not int or data["schema_version"] != 1
             or data.get("campaign_id") != self.campaign_id
             or data.get("policy_sha256") != self.policy
         ):
             raise BudgetError("Existing campaign/policy differs; do not reset the budget")
         if not isinstance(data.get("reservations"), list):
             raise BudgetError("Invalid ledger")
+        seen = set()
+        for record in data["reservations"]:
+            try:
+                base = {
+                    "id", "stage", "status", "reserved_seconds", "reserved_usd",
+                    "created_unix", "deadline_unix", "remote_call_id",
+                }
+                status = record["status"]
+                expected = base if status == "reserved" else base | {"charged_seconds", "charged_usd"}
+                valid = (
+                    set(record) == expected
+                    and isinstance(record["id"], str) and bool(record["id"])
+                    and record["id"] not in seen
+                    and record["stage"] in ("pilot", "formal", "rerun")
+                    and status in ("reserved", "settled", "overrun")
+                    and type(record["reserved_seconds"]) is int and record["reserved_seconds"] > 0
+                    and isinstance(record["reserved_usd"], str)
+                    and Decimal(record["reserved_usd"]) == self.config.rate_per_second * record["reserved_seconds"]
+                    and all(type(record[k]) in (int, float) and math.isfinite(record[k])
+                            for k in ("created_unix", "deadline_unix"))
+                    and record["deadline_unix"] > record["created_unix"]
+                    and record["deadline_unix"] == record["created_unix"] + record["reserved_seconds"]
+                    and (record["remote_call_id"] is None or (
+                        isinstance(record["remote_call_id"], str) and bool(record["remote_call_id"].strip())
+                    ))
+                )
+                if status != "reserved":
+                    valid = valid and (
+                        type(record["charged_seconds"]) is int and record["charged_seconds"] >= 0
+                        and isinstance(record["charged_usd"], str)
+                        and Decimal(record["charged_usd"]) == self.config.rate_per_second * record["charged_seconds"]
+                        and (status == "overrun") == (record["charged_seconds"] > record["reserved_seconds"])
+                    )
+                if not valid:
+                    raise BudgetError("Invalid ledger reservation; preserve it and reconcile before continuing")
+                seen.add(record["id"])
+            except (KeyError, TypeError, InvalidOperation, OverflowError) as exc:
+                raise BudgetError("Invalid ledger reservation; preserve it and reconcile before continuing") from exc
         return data
 
     @staticmethod
@@ -84,6 +124,8 @@ class Ledger:
         if seconds > self.config.experiment["block_timeout_s"]:
             raise BudgetError("Reservation exceeds the maximum block duration")
         now = time.time() if now is None else now
+        if type(now) not in (int, float) or not math.isfinite(now) or now + seconds <= now:
+            raise BudgetError("Reservation start/deadline must be finite and increasing")
         cost = self.config.rate_per_second * seconds
         limits = self.config.data["budget"]
         with self._exclusive():
@@ -114,7 +156,7 @@ class Ledger:
             return dict(record)
 
     def attach_call(self, reservation_id: str, call_id: str) -> None:
-        if not call_id:
+        if not isinstance(call_id, str) or not call_id.strip():
             raise BudgetError("Call ID cannot be empty")
         with self._exclusive():
             data = self.read()
@@ -159,4 +201,12 @@ class Ledger:
             "exposure_seconds": sum(self._seconds(r) for r in records),
             "unresolved": [r["id"] for r in records if r["status"] == "reserved"],
             "overruns": [r["id"] for r in records if r["status"] == "overrun"],
+            "reservation_ids": [r["id"] for r in records],
+            "stages": {
+                stage: {
+                    "reservations": sum(r["stage"] == stage for r in records),
+                    "exposure_seconds": sum(self._seconds(r) for r in records if r["stage"] == stage),
+                }
+                for stage in ("pilot", "formal", "rerun")
+            },
         }

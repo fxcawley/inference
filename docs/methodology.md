@@ -14,6 +14,14 @@ The request uses integer prompt IDs, fixed output length, temperature 0, top-p 1
 
 The sampling-seed base is the first seven hexadecimal digits of a canonical SHA-256 hash of the global seed, profile, repetition, and phase. The client adds the request ordinal. Engine and concurrency do not enter that derivation.
 
+## Pilot and protocol selection
+
+The pilot has one repetition per engine and all twelve profile/concurrency pairs. Each cell uses `max(16, 2*C)` timed requests and the configured common warmup. Its prompt IDs and seeds are separate from formal measurement and formal warmup. The default pilot contains 768 timed and 672 warmup requests; conformance probes are additional.
+
+Forecasting requires complete, valid pilot and warmup records for both engines, checked block timings, and the existing campaign budget. For every retained profile/concurrency pair, use the slower engine's seconds per request and warmup duration. Scale measured time by the formal request count. Use the maximum observed startup and noncell overhead across engines; scale noncell overhead up with the total request volume, including warmup, and never down. Add 210 seconds per fresh block for container initialization and final shutdown/commit work outside the runner's timing. Apply 25% headroom to the whole block and round up to seconds.
+
+Evaluate the full matrix, dropping C=32, retaining only `short`/`prefill`, and finally reducing to 200 requests per cell, in that order. Both engines and three repetitions remain mandatory. Check block, stage, campaign-time, and dollar limits before recommending a configuration. Formal measurements cannot trigger a later protocol reduction. If the smallest agreed study does not fit, stop after the pilot. Forecasts use finite-batch pilot observations and are estimates; absolute deadlines and the persistent ledger supply the execution bounds.
+
 ## Client and timing
 
 HTTPX 0.28.1 supplies one common HTTP transport. The client connects directly to a loopback origin, disables environment proxies and redirects, pre-serializes request payloads, and permits at least the configured concurrent connections.
@@ -51,6 +59,8 @@ Atomic files, SHA-256 manifests, and completion markers distinguish durable bund
 Analysis verifies the exact file set, protocol/source/image/harness identities, request phases and shapes, and stored summaries against recomputed raw metrics. The protocol includes a path-independent hash of the harness's Python source files; the worker checks its actual source before hardware inspection or model startup. Analysis can use a later implementation, but all input cells must identify the same frozen measurement harness. It rejects mixed campaigns, mismatched summaries, unqualified formal evidence, and missing completion evidence for purportedly successful cells.
 
 All planned cells remain represented. Missing cells and failed attempts appear in `failures.csv`. Aggregation selects the first valid attempt, not the fastest, and the figures plot only groups with the complete repetition set. The third figure shows concurrency-labelled throughput/latency points with both horizontal and vertical run ranges.
+
+Recovery can inspect an unsealed campaign, but it still validates every completed cell and rejects corrupt checksums. Unsealed cells remain invalid even when their raw files look complete. Each replacement must retain and link to attempt 1; no third attempt is permitted. Recovery proposals preserve the frozen schedule, require the same harness and existing budget history, and keep outstanding reservations until external termination is confirmed.
 
 Synthetic fixtures require explicit analysis/export opt-in, carry visible labels in every figure, and cannot be promoted to measured results by changing a campaign label. Their arbitrary timings test the pipeline; they contain no information about engine speed.
 

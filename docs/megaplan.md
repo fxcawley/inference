@@ -8,6 +8,8 @@ Build a reproducible public comparison of vLLM and SGLang serving Gemma 4 26B-A4
 
 Implementation choices for the offline stage: HTTPX 0.28.1 supplies the common streaming transport, standard-library `unittest` supplies CPU tests, and the analysis emits SVG directly. These replace the proposed aiohttp/pytest/Matplotlib dependencies while preserving the experimental contract. The hash-locked remote environments and Modal GPU orchestration remain external qualification work.
 
+The November 2 offline continuation implemented the bounded pilot schedule and separate inputs, artifact-based cost forecasts for the four agreed protocol sizes, and read-only recovery planning with persistent budget/attempt checks. `planning.py` provides these local plans; it does not dispatch remote calls. See the runbook for commands, evidence requirements, and the forecast's overhead assumptions.
+
 The project decisions are:
 
 | Question | Decision |

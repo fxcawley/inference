@@ -20,6 +20,7 @@ def main(argv=None) -> int:
         command.add_argument("--config", type=Path, default=Path("configs/benchmark.toml"))
         if name == "plan":
             command.add_argument("--json", action="store_true")
+            command.add_argument("--phase", choices=("measurement", "pilot"), default="measurement")
         elif name == "validate":
             command.add_argument("--require-ready", action="store_true")
         elif name == "commands":
@@ -27,6 +28,7 @@ def main(argv=None) -> int:
             command.add_argument("--model-path", required=True)
         elif name == "example":
             command.add_argument("--output", type=Path, required=True)
+            command.add_argument("--phase", choices=("measurement", "pilot"), default="measurement")
         elif name == "prepare-prompts":
             command.add_argument("--model-dir", type=Path, required=True)
             command.add_argument("--corpus-jsonl", type=Path, required=True)
@@ -43,6 +45,11 @@ def main(argv=None) -> int:
     bundle_parser.add_argument("--input", type=Path, required=True)
     bundle_parser.add_argument("--output", type=Path, required=True)
     bundle_parser.add_argument("--allow-synthetic", action="store_true")
+    for name in ("forecast", "resume-plan"):
+        planning_parser = commands.add_parser(name)
+        planning_parser.add_argument("--input", type=Path, required=True)
+        planning_parser.add_argument("--ledger", type=Path, required=True)
+        planning_parser.add_argument("--allow-synthetic", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "verify-artifacts":
@@ -64,6 +71,12 @@ def main(argv=None) -> int:
             result = bundle(args.input, args.output, allow_synthetic=args.allow_synthetic)
             print(f'Wrote {result["file"]}; SHA-256 {result["sha256"]}')
             return 0
+        if args.command in ("forecast", "resume-plan"):
+            from .planning import forecast_campaign, resume_plan
+            plan = forecast_campaign if args.command == "forecast" else resume_plan
+            result = plan(args.input, args.ledger, allow_synthetic=args.allow_synthetic)
+            print(json.dumps(result, indent=2))
+            return 0
         config = load_config(args.config)
         if args.command == "prepare-prompts":
             from .preparation import prepare_local
@@ -74,13 +87,14 @@ def main(argv=None) -> int:
         engines = read_json(args.config.parent / "engines.lock.json")
         problems = qualification_errors(sources, engines)
         if args.command == "plan":
-            result = config.describe()
+            result = config.describe(phase=args.phase)
             result["qualification_pending"] = problems
             if args.json:
                 print(json.dumps(result, indent=2))
             else:
                 print(
-                    f'{result["cells"]} cells; {result["measured_requests"]:,} measured requests\n'
+                    f'{result["cells"]} cells; {result["measured_requests"]:,} {args.phase} requests\n'
+                    f'{result["warmup_requests"]:,} separate warmup requests\n'
                     f'{result["input_tokens"]:,} input tokens; {result["output_tokens"]:,} output tokens\n'
                     f'Nominal container rate: ${float(result["container_usd_per_hour"]):.6f}/hour\n'
                     f'Project limit: ${config.data["budget"]["total_usd"]:.2f} gross\n'
@@ -103,7 +117,7 @@ def main(argv=None) -> int:
             print("Candidate argv only; installed flags and runtime behavior remain unqualified.", file=sys.stderr)
         elif args.command == "example":
             from .examples import make_example
-            make_example(args.output, config, sources, engines)
+            make_example(args.output, config, sources, engines, phase=args.phase)
             print(f"SYNTHETIC fixture written to {args.output}. No model or GPU was used.")
         return 0
     except (ValueError, OSError, RuntimeError) as exc:

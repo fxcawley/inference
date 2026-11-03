@@ -152,9 +152,19 @@ class Config:
             + Decimal(str(p["memory_per_gib_second"])) * Decimal(h["memory_mib"]) / 1024
         )
 
-    def cells(self) -> list[Cell]:
+    def request_count(self, concurrency: int, *, phase: str = "measurement") -> int:
+        if phase not in ("measurement", "pilot"):
+            raise ValueError("Schedule phase must be measurement or pilot")
+        return max(16, 2 * concurrency) if phase == "pilot" else self.experiment["requests_per_cell"]
+
+    def warmup_count(self, concurrency: int) -> int:
+        return max(self.experiment["warmup_min"], self.experiment["warmup_waves"] * concurrency)
+
+    def cells(self, *, phase: str = "measurement") -> list[Cell]:
+        self.request_count(1, phase=phase)
+        repetitions = 1 if phase == "pilot" else self.experiment["repetitions"]
         result = []
-        for repetition in range(1, self.experiment["repetitions"] + 1):
+        for repetition in range(1, repetitions + 1):
             pairs = [(p, c) for p in self.profile_names for c in self.experiment["concurrency"]]
             random.Random(self.experiment["seed"] + repetition).shuffle(pairs)
             engines = ("vllm", "sglang") if repetition % 2 else ("sglang", "vllm")
@@ -162,18 +172,22 @@ class Config:
                 result.extend(Cell(engine, p, c, repetition) for p, c in pairs)
         return result
 
-    def describe(self) -> dict:
-        cells = self.cells()
-        n = self.experiment["requests_per_cell"]
+    def describe(self, *, phase: str = "measurement") -> dict:
+        cells = self.cells(phase=phase)
+        counts = [self.request_count(c.concurrency, phase=phase) for c in cells]
         return {
-            "config_sha256": self.fingerprint,
-            "cells": len(cells), "measured_requests": n * len(cells),
-            "input_tokens": n * sum(self.profiles[c.profile]["input_tokens"] for c in cells),
-            "output_tokens": n * sum(self.profiles[c.profile]["output_tokens"] for c in cells),
+            "config_sha256": self.fingerprint, "phase": phase,
+            "cells": len(cells), "measured_requests": sum(counts),
+            "warmup_requests": sum(self.warmup_count(c.concurrency) for c in cells),
+            "input_tokens": sum(n * self.profiles[c.profile]["input_tokens"] for c, n in zip(cells, counts)),
+            "output_tokens": sum(n * self.profiles[c.profile]["output_tokens"] for c, n in zip(cells, counts)),
             "container_usd_per_hour": str(self.rate_per_second * 3600),
             "budget": self.data["budget"],
             "runtime_forecast": None,
-            "schedule": [c.to_dict() for c in cells],
+            "schedule": [
+                {**c.to_dict(), "requests": n, "warmup_requests": self.warmup_count(c.concurrency)}
+                for c, n in zip(cells, counts)
+            ],
         }
 
 

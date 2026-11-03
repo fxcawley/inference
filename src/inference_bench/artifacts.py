@@ -112,12 +112,25 @@ IDENTITY_FIELDS = (
 )
 
 
+def campaign_phase(manifest: dict) -> str:
+    kind = manifest["evidence_kind"]
+    expected = "pilot" if kind == "pilot" else "measurement"
+    phase = manifest.get("phase", expected)
+    if phase not in ("measurement", "pilot") or (kind != "synthetic" and phase != expected):
+        raise ValueError("Campaign phase differs from its evidence kind")
+    return phase
+
+
 def create_campaign(
     root: Path, config, sources: dict, engines: dict, *, campaign_id: str,
-    evidence_kind: str, harness: dict,
+    evidence_kind: str, harness: dict, phase: str | None = None,
 ) -> dict:
     if evidence_kind not in ("measurement", "pilot", "synthetic"):
         raise ValueError("Unknown evidence kind")
+    phase = campaign_phase({
+        "evidence_kind": evidence_kind,
+        **({"phase": phase} if phase is not None else {}),
+    })
     harness = {**harness, "source_sha256": source_tree_hash()}
     if evidence_kind == "measurement":
         problems = measurement_errors(config.data, sources, engines, harness)
@@ -133,7 +146,8 @@ def create_campaign(
     manifest = {
         "schema_version": 1, "campaign_id": campaign_id, "evidence_kind": evidence_kind,
         **identities, "protocol_sha256": digest_json(identities),
-        "harness": harness, "schedule": [c.to_dict() for c in config.cells()],
+        "harness": harness, "phase": phase,
+        "schedule": [c.to_dict() for c in config.cells(phase=phase)],
     }
     write_json(root / "campaign.json", manifest)
     write_json(root / "protocol.json", config.data)

@@ -10,7 +10,7 @@ from typing import Protocol
 from .config import Config
 from .provenance import digest_json
 
-GENERATOR_VERSION = "1"
+GENERATOR_VERSION = "2"
 EXCERPT_MARKER = "__INFERENCE_BENCH_EXCERPT_8C53A7__"
 
 
@@ -86,14 +86,17 @@ def prepare_prompts(
         if excerpt_size < 1 or excerpt_size > len(corpus_tokens):
             raise ValueError(f"{profile}: corpus/template cannot satisfy the input budget")
         for repetition in range(1, config.experiment["repetitions"] + 1):
-            for phase in ("measurement", "warmup"):
-                count = (
-                    config.experiment["requests_per_cell"] if phase == "measurement"
-                    else max(
-                        config.experiment["warmup_min"],
-                        config.experiment["warmup_waves"] * max(config.experiment["concurrency"]),
-                    )
+            maximum = max(config.experiment["concurrency"])
+            counts = {
+                "measurement": config.request_count(maximum),
+                "warmup": config.warmup_count(maximum),
+            }
+            if repetition == 1:
+                counts.update(
+                    pilot=config.request_count(maximum, phase="pilot"),
+                    pilot_warmup=config.warmup_count(maximum),
                 )
+            for phase, count in counts.items():
                 identity = {
                     "seed": config.experiment["seed"], "profile": profile,
                     "repetition": repetition, "phase": phase,

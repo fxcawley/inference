@@ -115,5 +115,7 @@ def prepare_local(
     write_json(output / "source-offsets.json", offsets)
     write_jsonl(output / "measured.jsonl.gz", (p for p in prompts if p["phase"] == "measurement"))
     write_jsonl(output / "warmup.jsonl.gz", (p for p in prompts if p["phase"] == "warmup"))
+    write_jsonl(output / "pilot.jsonl.gz", (p for p in prompts if p["phase"] == "pilot"))
+    write_jsonl(output / "pilot-warmup.jsonl.gz", (p for p in prompts if p["phase"] == "pilot_warmup"))
     seal(output)
     return manifest

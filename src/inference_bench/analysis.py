@@ -7,8 +7,10 @@ import io
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from .artifacts import IDENTITY_FIELDS, atomic_write, read_jsonl, verify, write_json
-from .config import Config
+from .artifacts import (
+    IDENTITY_FIELDS, atomic_write, campaign_phase, read_jsonl, safe_path, verify, write_json,
+)
+from .config import Cell, Config
 from .metrics import AGGREGATE_METRICS, aggregate, summarize
 from .provenance import digest_json, is_hash, measurement_errors, read_json
 
@@ -17,9 +19,38 @@ def _cell_key(row: dict) -> tuple:
     return (row["engine"], row["profile"], row["concurrency"], row["repetition"])
 
 
-def load_campaign(root: Path, *, allow_synthetic: bool = False) -> tuple[dict, Config, list[dict]]:
-    verify(root)
-    manifest = read_json(root / "campaign.json")
+def load_cell_summary(directory: Path, config: Config, *, phase: str, warmup: bool = False) -> dict:
+    metadata = read_json(safe_path(directory, "manifest.json"))
+    records = read_jsonl(safe_path(directory, "warmup.jsonl.gz" if warmup else "requests.jsonl.gz"))
+    shape = config.profiles[metadata["profile"]]
+    for row in records:
+        identity = (
+            *IDENTITY_FIELDS, "engine", "profile", "concurrency", "repetition", "attempt", "cell_id",
+            *(k for k in ("reservation_id", "replacement_for") if k in metadata),
+        )
+        if any(row.get(k) != metadata[k] for k in identity):
+            raise ValueError("Request identity differs from its cell")
+        if row["phase"] != ("warmup" if warmup else phase):
+            raise ValueError("Mixed warmup/pilot/measured records")
+        if (
+            row["expected_input_tokens"] != shape["input_tokens"]
+            or row["requested_output_tokens"] != shape["output_tokens"]
+        ):
+            raise ValueError("Request shape differs from the frozen profile")
+    count = (
+        config.warmup_count(metadata["concurrency"]) if warmup
+        else config.request_count(metadata["concurrency"], phase=phase)
+    )
+    return summarize(records, expected_requests=count)
+
+
+def load_campaign(
+    root: Path, *, allow_synthetic: bool = False, allow_incomplete: bool = False,
+) -> tuple[dict, Config, list[dict]]:
+    root = Path(root)
+    if not allow_incomplete or safe_path(root, "COMPLETE.json").exists():
+        verify(root)
+    manifest = read_json(safe_path(root, "campaign.json"))
     if manifest.get("schema_version") != 1:
         raise ValueError("Unsupported campaign schema")
     kind = manifest.get("evidence_kind")
@@ -27,9 +58,10 @@ def load_campaign(root: Path, *, allow_synthetic: bool = False) -> tuple[dict, C
         raise ValueError("Unknown campaign evidence kind")
     if kind == "synthetic" and not allow_synthetic:
         raise ValueError("Synthetic fixtures require --allow-synthetic; they are not measurements")
-    config = Config(read_json(root / "protocol.json"))
-    sources = read_json(root / "sources.lock.json")
-    engines = read_json(root / "engines.lock.json")
+    phase = campaign_phase(manifest)
+    config = Config(read_json(safe_path(root, "protocol.json")))
+    sources = read_json(safe_path(root, "sources.lock.json"))
+    engines = read_json(safe_path(root, "engines.lock.json"))
     if not is_hash(manifest.get("harness", {}).get("source_sha256")):
         raise ValueError("Campaign lacks its frozen harness source identity")
     if kind == "measurement":
@@ -50,13 +82,25 @@ def load_campaign(root: Path, *, allow_synthetic: bool = False) -> tuple[dict, C
     planned = {_cell_key(c): c for c in schedule}
     if len(planned) != len(schedule):
         raise ValueError("Duplicate scheduled cell")
-    if planned != {_cell_key(c.to_dict()): c.to_dict() for c in config.cells()}:
+    if schedule != [c.to_dict() for c in config.cells(phase=phase)]:
         raise ValueError("Campaign schedule differs from its frozen configuration")
     cells = []
     found = set()
-    phase = "pilot" if kind == "pilot" else "measurement"
-    for path in sorted(root.glob("runs/**/cells/*/manifest.json")):
+    attempts = {}
+    for directory in sorted(root.glob("runs/**/cells/*")):
+        safe_path(root, directory.relative_to(root).as_posix())
+        if not directory.is_dir():
+            continue
+        path = safe_path(directory, "manifest.json")
+        if not path.is_file():
+            raise ValueError("A cell directory lacks its attempt manifest; recover its identity first")
         metadata = read_json(path)
+        if (
+            not isinstance(metadata, dict)
+            or any(not isinstance(metadata.get(k), str) for k in ("engine", "profile"))
+            or any(type(metadata.get(k)) is not int for k in ("concurrency", "repetition"))
+        ):
+            raise ValueError("Invalid cell identity")
         if any(metadata.get(key) != manifest[key] for key in IDENTITY_FIELDS):
             raise ValueError(f"Mixed campaign provenance in {path.relative_to(root)}")
         key = _cell_key(metadata)
@@ -64,40 +108,50 @@ def load_campaign(root: Path, *, allow_synthetic: bool = False) -> tuple[dict, C
             raise ValueError("Unscheduled cell in result bundle")
         if type(metadata.get("attempt")) is not int or metadata["attempt"] not in (1, 2):
             raise ValueError("Unexpected replacement-attempt number")
+        if metadata.get("cell_id") != Cell(**planned[key]).key:
+            raise ValueError("Cell ID differs from its scheduled identity")
+        history = attempts.setdefault(key, {})
+        if metadata["attempt"] in history:
+            raise ValueError("Duplicate cell attempt")
         found.add(key)
         summary = dict.fromkeys(AGGREGATE_METRICS)
-        summary.update(valid=False, expected_requests=config.experiment["requests_per_cell"])
-        status = read_json(path.parent / "status.json").get("status")
-        if (path.parent / "COMPLETE.json").is_file() and (path.parent / "requests.jsonl.gz").is_file():
+        summary.update(
+            valid=False, expected_requests=config.request_count(metadata["concurrency"], phase=phase),
+        )
+        status_path = safe_path(directory, "status.json")
+        status = read_json(status_path).get("status") if status_path.exists() else "interrupted"
+        if status not in ("started", "complete", "failed", "interrupted", "budget_stopped"):
+            raise ValueError("Unknown cell status")
+        complete = safe_path(directory, "COMPLETE.json").exists()
+        if complete:
             verify(path.parent)
-            records = read_jsonl(path.parent / "requests.jsonl.gz")
-            shape = config.profiles[metadata["profile"]]
-            for row in records:
-                if any(row.get(k) != metadata[k] for k in (*IDENTITY_FIELDS, *planned[key], "attempt")):
-                    raise ValueError("Request identity differs from its cell")
-                if row["phase"] != phase:
-                    raise ValueError("Mixed warmup/pilot/measured records")
-                if (
-                    row["expected_input_tokens"] != shape["input_tokens"]
-                    or row["requested_output_tokens"] != shape["output_tokens"]
-                ):
-                    raise ValueError("Request shape differs from the frozen profile")
-            summary = summarize(records, expected_requests=config.experiment["requests_per_cell"])
+        if complete and safe_path(directory, "requests.jsonl.gz").is_file():
+            summary = load_cell_summary(path.parent, config, phase=phase)
             if read_json(path.parent / "summary.json") != summary:
                 raise ValueError("Stored summary disagrees with raw request records")
             if summary["valid"] != (status == "complete"):
                 raise ValueError("Cell status disagrees with measured validity")
         elif status == "complete":
-            raise ValueError("A completed cell lacks committed request evidence")
-        cells.append({
+            if not allow_incomplete or complete:
+                raise ValueError("A completed cell lacks committed request evidence")
+            status = "interrupted"
+        row = {
             **planned[key], "attempt": metadata["attempt"], "status": status,
             **summary, "artifact": path.parent.relative_to(root).as_posix(),
-        })
+            "reservation_id": metadata.get("reservation_id"),
+            "replacement_for": metadata.get("replacement_for"),
+        }
+        cells.append(row)
+        history[metadata["attempt"]] = row
+    for history in attempts.values():
+        if 2 in history and (1 not in history or history[2]["replacement_for"] != history[1]["artifact"]):
+            raise ValueError("A replacement must retain and link to its original attempt")
     for key in sorted(set(planned) - found):
         cells.append({
             **planned[key], "attempt": 0, "status": "missing", "valid": False,
             **dict.fromkeys(AGGREGATE_METRICS),
-            "expected_requests": config.experiment["requests_per_cell"], "artifact": None,
+            "expected_requests": config.request_count(planned[key]["concurrency"], phase=phase),
+            "artifact": None,
         })
     return manifest, config, cells
 
@@ -204,7 +258,9 @@ def analyze(root: Path, output: Path, *, allow_synthetic: bool = False) -> dict:
     if output.resolve().is_relative_to(root.resolve()):
         raise ValueError("Analysis output must be outside the sealed input bundle")
     manifest, config, cells = load_campaign(root, allow_synthetic=allow_synthetic)
-    groups = aggregate(cells, expected_repetitions=config.experiment["repetitions"])
+    phase = campaign_phase(manifest)
+    repetitions = 1 if phase == "pilot" else config.experiment["repetitions"]
+    groups = aggregate(cells, expected_repetitions=repetitions)
     for group in groups:
         throughput = group["output_tokens_per_s"]
         group["gpu_usd_per_million_output_tokens"] = (
@@ -224,10 +280,9 @@ def analyze(root: Path, output: Path, *, allow_synthetic: bool = False) -> dict:
         "pilot": "PILOT — not the formal comparison",
         "measurement": "Gemma 4 · H200 · BF16",
     }[kind]
-    annotation = (
-        f'{label} · {config.experiment["requests_per_cell"]} requests/cell'
-        f' · {config.experiment["repetitions"]} repetitions'
-    )
+    count_label = "max(16, 2×C)" if phase == "pilot" else str(config.experiment["requests_per_cell"])
+    repetition_label = "repetition" if repetitions == 1 else "repetitions"
+    annotation = f"{label} · {phase} · {count_label} requests/cell · {repetitions} {repetition_label}"
     figures = (
         ("throughput", "Output throughput", "concurrency", ("output_tokens_per_s",), "Output tokens / second"),
         ("ttft", "Time to first streamed text", "concurrency", ("ttft_ms_p50", "ttft_ms_p95"), "TTFT (ms)"),

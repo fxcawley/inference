@@ -180,3 +180,97 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(a["sha256"], b["sha256"])
         with self.assertRaises(ValueError):
             analyze(self.input, self.input / "report", allow_synthetic=True)
+
+
+class PilotAnalysisTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.input = self.root / "pilot"
+        make_example(
+            self.input, load_config(ROOT / "configs/benchmark.toml"),
+            read_json(ROOT / "configs/sources.lock.json"),
+            read_json(ROOT / "configs/engines.lock.json"), phase="pilot",
+        )
+        self.ledger = self.input / "budget-ledger.json"
+
+    def test_pilot_analysis_and_forecast_preserve_synthetic_labels(self):
+        from inference_bench.planning import forecast_campaign
+        manifest, config, cells = load_campaign(self.input, allow_synthetic=True)
+        self.assertEqual(len(cells), 24)
+        self.assertEqual(sum(c["expected_requests"] for c in cells), 768)
+        self.assertTrue(all(c["valid"] for c in cells))
+        claims = analyze(self.input, self.root / "report", allow_synthetic=True)
+        self.assertFalse(claims["publishable_measurements"])
+        self.assertTrue(all(g["complete"] and g["expected_repetitions"] == 1 for g in claims["groups"]))
+        with self.assertRaisesRegex(ValueError, "Synthetic"):
+            forecast_campaign(self.input, self.ledger)
+        report = forecast_campaign(self.input, self.ledger, allow_synthetic=True)
+        self.assertEqual(report["evidence_kind"], "synthetic")
+        self.assertTrue(report["advisory_only"])
+        self.assertEqual(report["recommended_protocol"], "full")
+        self.assertEqual(report["basis"]["observed_startup_seconds"], "1")
+        self.assertAlmostEqual(float(report["basis"]["observed_noncell_overhead_seconds"]), 2)
+        self.assertEqual([c["cells"] for c in report["candidates"]], [72, 54, 36, 36])
+        # The slower engine's durations determine both engines' six formal blocks.
+        from decimal import Decimal
+        import math
+        expected = Decimal(211) + Decimal(2) * 3408 / 720
+        for cell in cells:
+            if cell["engine"] == "sglang":
+                from inference_bench.analysis import load_cell_summary
+                warmup = load_cell_summary(self.input / cell["artifact"], config, phase="pilot", warmup=True)
+                expected += Decimal(str(warmup["wall_time_s"]))
+                expected += Decimal(str(cell["wall_time_s"])) * 256 / cell["expected_requests"]
+        self.assertEqual(report["candidates"][0]["total_seconds"], math.ceil(expected * Decimal("1.25")) * 6)
+        self.assertEqual(manifest["phase"], "pilot")
+
+    def test_forecast_requires_real_ledger_state_and_refuses_mid_campaign_resize(self):
+        from inference_bench.budget import Ledger
+        from inference_bench.planning import forecast_campaign
+        with self.assertRaisesRegex(ValueError, "existing campaign ledger"):
+            forecast_campaign(self.input, self.root / "missing.json", allow_synthetic=True)
+        manifest, config, _ = load_campaign(self.input, allow_synthetic=True)
+        ledger_path = self.root / "working-ledger.json"
+        ledger_path.write_bytes(self.ledger.read_bytes())
+        ledger = Ledger(ledger_path, manifest["campaign_id"], config)
+        reservation = ledger.reserve("pilot", 60, now=0)
+        report = forecast_campaign(self.input, ledger_path, allow_synthetic=True)
+        self.assertIsNone(report["recommended_protocol"])
+        self.assertIn("Outstanding reservations", report["blockers"][0])
+        ledger.settle(reservation["id"], 10, confirmed_stopped=True)
+        reservation = ledger.reserve("formal", 60)
+        ledger.settle(reservation["id"], 0, confirmed_stopped=True)
+        report = forecast_campaign(self.input, ledger_path, allow_synthetic=True)
+        self.assertIsNone(report["recommended_protocol"])
+        self.assertTrue(any("cannot be resized" in reason for reason in report["blockers"]))
+
+    def test_forecast_rejects_missing_warmup_and_inconsistent_block_timing(self):
+        from inference_bench.planning import forecast_campaign
+        timing_path = next(self.input.glob("runs/**/timing.json"))
+        timing = read_json(timing_path)
+        write_json(timing_path, {**timing, "finished_ns": timing["ready_ns"]})
+        reseal(timing_path.parent)
+        reseal(self.input)
+        with self.assertRaisesRegex(ValueError, "windows exceed"):
+            forecast_campaign(self.input, self.ledger, allow_synthetic=True)
+        write_json(timing_path, timing)
+        warmup_path = next(timing_path.parent.glob("cells/*/warmup.jsonl.gz"))
+        warmup_path.unlink()
+        reseal(warmup_path.parent)
+        reseal(timing_path.parent)
+        reseal(self.input)
+        with self.assertRaises(OSError):
+            forecast_campaign(self.input, self.ledger, allow_synthetic=True)
+
+    def test_forecast_does_not_guess_missing_concurrency_observations(self):
+        import shutil
+        from inference_bench.planning import forecast_campaign
+        missing = self.input / "runs/vllm/r1/attempt-1/cells/short-c32"
+        block = missing.parent.parent
+        shutil.rmtree(missing)
+        reseal(block)
+        reseal(self.input)
+        with self.assertRaisesRegex(ValueError, "coverage must be complete"):
+            forecast_campaign(self.input, self.ledger, allow_synthetic=True)
