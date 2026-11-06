@@ -22,8 +22,8 @@ CONTAINER_OVERHEAD_SECONDS = 210
 def _ledger_summary(path: Path, manifest: dict, config: Config) -> tuple[dict, list[str]]:
     path = Path(path)
     if not path.is_file():
-        raise BudgetError("An existing campaign ledger is required; a missing ledger is not zero usage")
-    summary = Ledger(path, manifest["campaign_id"], config).summary()
+        raise BudgetError("An existing project ledger is required; a missing ledger is not zero usage")
+    summary = Ledger(path, config).summary()
     blockers = []
     if path.with_name(path.name + ".lock").exists():
         blockers.append("Ledger is locked; resolve the previous controller")
@@ -71,22 +71,6 @@ def _check_budget_links(root: Path, manifest: dict, cells: list[dict], summary: 
             for cell in cells
         ):
             raise BudgetError("A cell's reservation differs from its block receipt")
-
-
-def _remaining_budget(config: Config, summary: dict) -> dict:
-    budget = config.data["budget"]
-    return {
-        **{
-            f"{stage}_seconds": budget[f"{stage}_seconds"] - summary["stages"][stage]["exposure_seconds"]
-            for stage in ("pilot", "formal", "rerun")
-        },
-        "gpu_seconds": budget["max_gpu_seconds"] - summary["exposure_seconds"],
-        "gpu_usd": str(min(
-            Decimal(str(budget["gpu_container_usd"])),
-            Decimal(str(budget["total_usd"])) - Decimal(str(budget["other_usd"]))
-            - Decimal(str(budget["reserve_usd"])),
-        ) - Decimal(summary["exposure_usd"])),
-    }
 
 
 def protocol_candidates(config: Config) -> list[tuple[str, Config]]:
@@ -212,16 +196,18 @@ def forecast_campaign(
         blockers.append("Formal work has already started; its protocol cannot be resized")
     paired, startup_s, overhead_s = _pilot_observations(root, manifest, config, cells)
     estimates = estimate_protocols(config, paired, startup_s, overhead_s)
-    available = _remaining_budget(config, summary)
+    available = summary["remaining"]
+    multiplier = Decimal(summary["billing"]["rate_multiplier"])
     for estimate in estimates:
         reasons = []
+        estimate["projected_container_usd"] = str(Decimal(estimate["nominal_container_usd"]) * multiplier)
         if estimate["block_seconds"] > config.experiment["block_timeout_s"]:
             reasons.append("block duration exceeds its limit")
         if estimate["total_seconds"] > available["formal_seconds"]:
             reasons.append("formal stage time allowance exceeded")
         if estimate["total_seconds"] > available["gpu_seconds"]:
             reasons.append("remaining campaign time allowance exceeded")
-        if Decimal(estimate["nominal_container_usd"]) > Decimal(available["gpu_usd"]):
+        if Decimal(estimate["projected_container_usd"]) > Decimal(available["gpu_container_usd"]):
             reasons.append("remaining campaign dollar allowance exceeded")
         estimate.update(fits_budget=not reasons, reasons=reasons)
     recommended = next((e["name"] for e in estimates if e["fits_budget"]), None) if not blockers else None
@@ -234,6 +220,7 @@ def forecast_campaign(
             "container_overhead_seconds_per_block": CONTAINER_OVERHEAD_SECONDS,
             "observed_startup_seconds": str(startup_s),
             "observed_noncell_overhead_seconds": str(overhead_s),
+            "billing_rate_multiplier": str(multiplier),
             "method": (
                 "Slower engine per cell; maximum observed startup and warmup; "
                 "noncell overhead scaled up with request volume"
@@ -257,11 +244,12 @@ def resume_plan(root: Path, ledger_path: Path, *, allow_synthetic: bool = False)
         raise ValueError("Recovery planning applies to the frozen formal schedule")
     summary, blockers = _ledger_summary(ledger_path, manifest, config)
     _check_budget_links(root, manifest, cells, summary)
-    available = _remaining_budget(config, summary)
+    available = summary["remaining"]
+    rate = config.rate_per_second * Decimal(summary["billing"]["rate_multiplier"])
     maximum_reservation = {
         stage: max(0, min(
             config.experiment["block_timeout_s"], available[f"{stage}_seconds"],
-            available["gpu_seconds"], math.floor(Decimal(available["gpu_usd"]) / config.rate_per_second),
+            available["gpu_seconds"], math.floor(Decimal(available["gpu_container_usd"]) / rate),
         ))
         for stage in ("formal", "rerun")
     }

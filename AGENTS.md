@@ -26,6 +26,7 @@
 - Download official weights and public data inside Modal, with immutable revisions and checksums.
 - Use the $75 gross project budget and the plan's stage allocations, deadlines, serial execution, reservations, and billing reconciliation.
 - Preserve budget state when resuming or moving machines. Do not reset the campaign allowance on retries or a new billing month.
+- Use one project ledger, identified by `budget.ledger_id`, for pilot and formal stages. Record cumulative billing with `record-billing`; never edit the ledger to release allowance.
 - Keep credentials in the user's credential store or Modal Secrets. Upload only intended project source files.
 - Store raw artifacts and weights outside Git; publish the eventual raw-data bundle with checksums.
 
@@ -36,6 +37,8 @@
 - Write meaningful CPU tests for streaming/timing, token accounting, failure handling, process cleanup, and budget controls.
 - CI must remain CPU-only and must not launch paid jobs or require credentials.
 - Record actual validation outcomes. Do not describe documented support as a successful runtime qualification.
+- Mark an engine qualified only with a passed `qualify` report from real pilot evidence, recorded by path and SHA-256 in `configs/engines.lock.json`. Never accept a failed check or hand-edit a report.
+- Without network access, run `PYTHONPATH=src:tests python -m unittest test_protocol test_metrics test_runner test_client.DecoderTests test_client.RequestContractTests`; the remaining HTTP tests open loopback sockets.
 
 ## Article and site
 

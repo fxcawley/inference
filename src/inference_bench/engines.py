@@ -4,9 +4,26 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import subprocess
 
 from .config import Config
+from .provenance import digest_json
+
+MODEL_PLACEHOLDER = "<MODEL>"
+# Observed in earlier release logs; confirm against the pinned images during
+# qualification. A missing match is reported as unobserved, never inferred.
+LOG_PATTERNS = {
+    "vllm": {
+        "kv_cache_tokens": r"GPU KV cache size:\s*([\d,]+)\s+tokens",
+        "max_num_batched_tokens": r"max_num_batched_tokens=([\d,]+)",
+    },
+    "sglang": {
+        "kv_cache_tokens": r"max_total_num_tokens=([\d,]+)",
+        "chunked_prefill_size": r"chunked_prefill_size=(-?[\d,]+)",
+        "max_running_requests": r"max_running_requests=([\d,]+)",
+    },
+}
 
 
 def command(engine: str, model_path: str, config: Config, port: int = 8000) -> list[str]:
@@ -39,6 +56,43 @@ def command(engine: str, model_path: str, config: Config, port: int = 8000) -> l
     ]
 
 
+def normalized_argv(engine: str, argv: list[str]) -> list[str]:
+    """The qualified engine settings, independent of mount path and loopback port."""
+    if not isinstance(argv, list) or any(not isinstance(value, str) for value in argv):
+        raise ValueError("Server argv must be a list of strings")
+    result = list(argv)
+    try:
+        if engine == "vllm" and result[:2] == ["vllm", "serve"]:
+            model = 2
+        elif engine == "sglang" and result[:2] == ["sglang", "serve"]:
+            model = result.index("--model-path") + 1
+        else:
+            raise ValueError(f"Unexpected {engine} server argv")
+        port = result.index("--port") + 1
+        result[model], result[port] = MODEL_PLACEHOLDER, "<PORT>"
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"Unexpected {engine} server argv") from exc
+    return result
+
+
+def engine_settings_sha256(engine: str, config: Config) -> str:
+    return digest_json(normalized_argv(engine, command(engine, MODEL_PLACEHOLDER, config)))
+
+
+def resolved_settings(engine: str, log_text: str) -> dict:
+    values, evidence = {}, {}
+    for key, pattern in LOG_PATTERNS[engine].items():
+        matches = list(re.finditer(pattern, log_text))
+        values[key] = None
+        if matches:
+            match = matches[-1]
+            values[key] = int(match.group(1).replace(",", ""))
+            start = log_text.rfind("\n", 0, match.start()) + 1
+            end = log_text.find("\n", match.end())
+            evidence[key] = log_text[start:None if end < 0 else end].strip()[:300]
+    return {"values": values, "evidence": evidence, "patterns_confirmed": False}
+
+
 def validate_hardware(devices: list[dict]) -> None:
     if len(devices) != 1:
         raise ValueError("Exactly one GPU is required")
@@ -62,7 +116,6 @@ def inspect_hardware() -> list[dict]:
         if len(row) != 5:
             raise ValueError("Unexpected nvidia-smi output")
         name, memory, driver, device_id, mig = [item.strip() for item in row]
-        from .provenance import digest_json
         devices.append({
             "name": name, "memory_mib": int(memory), "driver": driver,
             "device_id_sha256": digest_json(device_id), "mig_mode": mig,

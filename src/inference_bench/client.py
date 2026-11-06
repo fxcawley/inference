@@ -54,7 +54,10 @@ class SSEDecoder:
         return events
 
 
-def request_body(prompt: dict, output_tokens: int, seed: int) -> dict:
+def request_body(
+    prompt: dict, output_tokens: int, seed: int, *,
+    ignore_eos: bool = True, stop_token_ids: list[int] | None = None,
+) -> dict:
     ids = prompt.get("prompt_ids")
     if not isinstance(ids, list) or not ids or any(type(i) is not int or i < 0 for i in ids):
         raise ValueError("A nonempty list of integer prompt IDs is required")
@@ -64,14 +67,25 @@ def request_body(prompt: dict, output_tokens: int, seed: int) -> dict:
         raise ValueError("Output-token target must be positive")
     if type(seed) is not int or not 0 <= seed < 2**31:
         raise ValueError("Sampling seed must be a nonnegative signed 32-bit integer")
-    return {
+    if type(ignore_eos) is not bool or (ignore_eos and stop_token_ids is not None):
+        raise ValueError("Fixed-length requests ignore EOS and cannot include stop tokens")
+    if stop_token_ids is not None and (
+        not isinstance(stop_token_ids, list) or not stop_token_ids
+        or any(type(i) is not int or i < 0 for i in stop_token_ids)
+    ):
+        raise ValueError("Stop token IDs must be a nonempty list of nonnegative integers")
+    body = {
         "model": "gemma4-bench", "prompt": ids, "max_tokens": output_tokens,
         "temperature": 0.0, "top_p": 1.0, "presence_penalty": 0.0,
         "frequency_penalty": 0.0, "repetition_penalty": 1.0,
-        "seed": seed, "n": 1, "echo": False, "stop": [], "ignore_eos": True,
+        "seed": seed, "n": 1, "echo": False, "stop": [], "ignore_eos": ignore_eos,
         "skip_special_tokens": False, "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if stop_token_ids is not None:
+        # Probes use the pinned model's stop IDs instead of either server's defaults.
+        body["stop_token_ids"] = stop_token_ids
+    return body
 
 
 def http_client(concurrency: int):
@@ -159,7 +173,7 @@ class ResponseTrace:
             "request_id": r["request_id"], "received_ns": received_ns, "data": event,
         })
 
-    def validate(self) -> None:
+    def validate(self, exact_output: bool = True) -> None:
         r = self.record
         if r["done_ns"] is None:
             raise StreamError("Stream ended without DONE")
@@ -167,8 +181,10 @@ class ResponseTrace:
             raise StreamError("Missing final authoritative usage")
         if r["actual_input_tokens"] != r["expected_input_tokens"]:
             raise StreamError("Server input usage differs from prepared length")
-        if r["actual_output_tokens"] != r["requested_output_tokens"]:
+        if exact_output and r["actual_output_tokens"] != r["requested_output_tokens"]:
             raise StreamError("Server output usage differs from the fixed target")
+        if not exact_output and not 1 <= r["actual_output_tokens"] <= r["requested_output_tokens"]:
+            raise StreamError("Server output usage lies outside the requested limit")
         if r["first_content_ns"] is None:
             raise StreamError("No streamed content was observable")
 
@@ -190,7 +206,8 @@ def _new_record(prompt: dict, ordinal: int, output_tokens: int, phase: str, cont
 async def run_cell(
     base_url: str, prompts: list[dict], *, concurrency: int, output_tokens: int,
     seed: int, timeout_s: float = 300, phase: str = "measurement",
-    context: dict | None = None, client=None,
+    context: dict | None = None, client=None, ignore_eos: bool = True,
+    stop_token_ids: list[int] | None = None,
 ) -> dict:
     """Stop new dispatch after a failure; drain existing work without retries."""
     url = urlsplit(base_url)
@@ -203,27 +220,32 @@ async def run_cell(
         raise ValueError("Concurrency must be positive and no larger than the request count")
     if timeout_s <= 0 or phase not in ("measurement", "warmup", "pilot", "conformance"):
         raise ValueError("Invalid timeout or phase")
+    if phase != "conformance" and (ignore_eos is not True or stop_token_ids is not None):
+        raise ValueError("Only conformance probes may honor EOS or stop tokens")
     ids = [p["request_id"] for p in prompts]
     if len(set(ids)) != len(ids):
         raise ValueError("Request IDs must be unique within a cell")
     payloads = [
-        canonical_json(request_body(p, output_tokens, seed + i)).encode("utf-8")
+        canonical_json(request_body(
+            p, output_tokens, seed + i, ignore_eos=ignore_eos, stop_token_ids=stop_token_ids,
+        )).encode("utf-8")
         for i, p in enumerate(prompts)
     ]
     if client is None:
         async with http_client(concurrency) as owned_client:
             return await _run(
                 base_url, prompts, payloads, concurrency, output_tokens, timeout_s,
-                phase, context or {}, owned_client, seed,
+                phase, context or {}, owned_client, seed, ignore_eos,
             )
     return await _run(
         base_url, prompts, payloads, concurrency, output_tokens, timeout_s,
-        phase, context or {}, client, seed,
+        phase, context or {}, client, seed, ignore_eos,
     )
 
 
 async def _run(
     base_url, prompts, payloads, concurrency, output_tokens, timeout_s, phase, context, client, seed,
+    exact_output,
 ):
     import httpx
 
@@ -279,7 +301,7 @@ async def _run(
                         # return to the pool. E2E still ends at the DONE receipt.
                         for data in decoder.feed(b"", final=True):
                             trace.accept(data, time.perf_counter_ns())
-                        trace.validate()
+                        trace.validate(exact_output)
                 record["status"] = "success"
             except asyncio.CancelledError:
                 record.update(
@@ -315,6 +337,7 @@ async def _run(
     from .metrics import summarize
     return {
         "records": records, "events": events,
-        "summary": summarize(records, expected_requests=len(prompts)),
+        # A probe that honors EOS is not a fixed-length measurement.
+        "summary": summarize(records, expected_requests=len(prompts)) if exact_output else None,
         "client_loop_lag_ms": loop_lag_ms, "client_lag_interval_ms": 10,
     }

@@ -9,8 +9,9 @@ from typing import Protocol
 
 from .config import Config
 from .provenance import digest_json
+from .qualification import PROBES, valid_token_ids
 
-GENERATOR_VERSION = "2"
+GENERATOR_VERSION = "3"
 EXCERPT_MARKER = "__INFERENCE_BENCH_EXCERPT_8C53A7__"
 
 
@@ -74,8 +75,60 @@ def template_parts(tokenizer: Tokenizer, instruction: str) -> tuple[list[int], l
     return prefix, suffix
 
 
-def prepare_prompts(
+def render_message(tokenizer: Tokenizer, text: str) -> list[int]:
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": text}],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    )
+    if not isinstance(rendered, str):
+        raise ValueError("Template rendering must produce text")
+    ids = tokenizer.encode(rendered, add_special_tokens=False)
+    if not ids or (tokenizer.bos_token_id is not None and ids.count(tokenizer.bos_token_id) != 1):
+        raise ValueError("A rendered probe must contain exactly one intended BOS")
+    return ids
+
+
+def _window(rng: random.Random, corpus_tokens: list[int], size: int, special: set[int]) -> tuple[int, list[int]]:
+    for _ in range(1000):
+        start = rng.randrange(len(corpus_tokens) - size + 1)
+        excerpt = corpus_tokens[start:start + size]
+        if not special.intersection(excerpt):
+            return start, excerpt
+    raise ValueError("Unable to select a corpus window without role/special tokens")
+
+
+def conformance_prompts(
     config: Config, corpus_tokens: list[int], tokenizer: Tokenizer,
+    prefix: list[int], suffix: list[int], stop_token_ids: list[int],
+) -> list[dict]:
+    """Untimed probes that use the same template; one summary uses the corpus."""
+    if not valid_token_ids(stop_token_ids):
+        raise ValueError("Conformance probes need the pinned model's stop token IDs")
+    size = min(shape["input_tokens"] for shape in config.profiles.values()) - len(prefix) - len(suffix)
+    rng = random.Random(int(digest_json({
+        "seed": config.experiment["seed"], "phase": "conformance", "generator": GENERATOR_VERSION,
+    })[:16], 16))
+    result = []
+    for probe in PROBES:
+        source = None
+        if probe["message"] is None:
+            start, excerpt = _window(rng, corpus_tokens, size, set(tokenizer.all_special_ids))
+            ids, source = prefix + excerpt + suffix, [start, start + size]
+        else:
+            ids = render_message(tokenizer, probe["message"])
+        if len(ids) + probe["max_tokens"] > config.experiment["max_model_len"]:
+            raise ValueError("A conformance probe exceeds the model context")
+        result.append({
+            "request_id": f'conformance:{probe["name"]}', "probe_name": probe["name"],
+            "phase": "conformance", "profile": None, "repetition": None,
+            "prompt_ids": ids, "prompt_sha256": digest_json(ids), "input_tokens": len(ids),
+            "stop_token_ids": sorted(set(stop_token_ids)), "source_span": source,
+        })
+    return result
+
+
+def prepare_prompts(
+    config: Config, corpus_tokens: list[int], tokenizer: Tokenizer, *, stop_token_ids: list[int],
 ) -> tuple[list[dict], dict]:
     prefix, suffix = template_parts(tokenizer, config.data["workload"]["instruction"])
     special = set(tokenizer.all_special_ids)
@@ -104,13 +157,7 @@ def prepare_prompts(
                 }
                 rng = random.Random(int(digest_json(identity)[:16], 16))
                 for ordinal in range(count):
-                    for _ in range(1000):
-                        start = rng.randrange(len(corpus_tokens) - excerpt_size + 1)
-                        excerpt = corpus_tokens[start:start + excerpt_size]
-                        if not special.intersection(excerpt):
-                            break
-                    else:
-                        raise ValueError("Unable to select a corpus window without role/special tokens")
+                    start, excerpt = _window(rng, corpus_tokens, excerpt_size, special)
                     ids = prefix + excerpt + suffix
                     assert len(ids) == shape["input_tokens"]
                     prompts.append({
@@ -120,12 +167,15 @@ def prepare_prompts(
                         "input_tokens": len(ids), "source_start": start,
                         "source_stop": start + excerpt_size,
                     })
+    prompts.extend(conformance_prompts(config, corpus_tokens, tokenizer, prefix, suffix, stop_token_ids))
     manifest = {
         "schema_version": 1, "generator_version": GENERATOR_VERSION,
         "config_sha256": config.fingerprint, "corpus_tokens_sha256": digest_json(corpus_tokens),
         "prefix_ids": prefix, "suffix_ids": suffix,
         "prefix_sha256": digest_json(prefix), "suffix_sha256": digest_json(suffix),
         "normalization": "NFC; collapse whitespace; omit empty and heading-only rows",
+        "stop_token_ids": sorted(set(stop_token_ids)),
+        "conformance_probes": [probe["name"] for probe in PROBES],
         "prompts_sha256": digest_json(prompts), "count": len(prompts),
     }
     return prompts, manifest

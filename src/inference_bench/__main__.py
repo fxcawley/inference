@@ -50,6 +50,23 @@ def main(argv=None) -> int:
         planning_parser.add_argument("--input", type=Path, required=True)
         planning_parser.add_argument("--ledger", type=Path, required=True)
         planning_parser.add_argument("--allow-synthetic", action="store_true")
+    qualify_parser = commands.add_parser("qualify")
+    qualify_parser.add_argument("--input", type=Path, required=True)
+    qualify_parser.add_argument("--engine", choices=("vllm", "sglang"), required=True)
+    qualify_parser.add_argument("--output", type=Path, required=True)
+    qualify_parser.add_argument("--preflight", type=Path)
+    qualify_parser.add_argument("--accept", action="append", default=[], metavar="CHECK=REASON")
+    qualify_parser.add_argument("--allow-synthetic", action="store_true")
+    for name in ("ledger", "record-billing"):
+        ledger_parser = commands.add_parser(name)
+        ledger_parser.add_argument("--config", type=Path, default=Path("configs/benchmark.toml"))
+        ledger_parser.add_argument("--ledger", type=Path, required=True)
+        if name == "record-billing":
+            ledger_parser.add_argument("--through", required=True, help="UTC time, e.g. 2026-11-05T18:00:00Z")
+            ledger_parser.add_argument("--gpu-usd", required=True)
+            ledger_parser.add_argument("--other-usd", required=True)
+            ledger_parser.add_argument("--source", type=Path, required=True)
+            ledger_parser.add_argument("--note", default="")
     args = parser.parse_args(argv)
     try:
         if args.command == "verify-artifacts":
@@ -77,7 +94,52 @@ def main(argv=None) -> int:
             result = plan(args.input, args.ledger, allow_synthetic=args.allow_synthetic)
             print(json.dumps(result, indent=2))
             return 0
+        if args.command == "qualify":
+            from .artifacts import write_json
+            from .provenance import digest_file
+            from .qualification import qualify
+            accepted = {}
+            for item in args.accept:
+                name, separator, reason = item.partition("=")
+                if not separator or name in accepted:
+                    raise ValueError("Use --accept CHECK=REASON once per check")
+                accepted[name] = reason
+            report = qualify(
+                args.input, args.engine, preflight=args.preflight, accepted=accepted,
+                allow_synthetic=args.allow_synthetic,
+            )
+            if args.output.exists():
+                raise ValueError("Refusing to replace an existing qualification report")
+            write_json(args.output, report)
+            print(json.dumps({
+                "report": str(args.output), "status": report["status"],
+                "evidence_kind": report["evidence_kind"], "report_sha256": digest_file(args.output),
+                "unresolved": [c["name"] for c in report["checks"] if c["status"] not in ("passed", "accepted")],
+            }, indent=2))
+            if report["status"] != "passed":
+                print("Qualification did not pass; the engine lock must remain pending.", file=sys.stderr)
+                return 3
+            return 0
         config = load_config(args.config)
+        if args.command in ("ledger", "record-billing"):
+            from .budget import Ledger
+            ledger = Ledger(args.ledger, config)
+            if args.command == "record-billing":
+                from datetime import datetime
+                from .provenance import digest_file
+                through = datetime.fromisoformat(args.through)
+                if through.tzinfo is None:
+                    raise ValueError("Billing times need an explicit time zone")
+                if not args.ledger.is_file():
+                    raise ValueError("An existing project ledger is required")
+                ledger.record_billing(
+                    through.timestamp(), args.gpu_usd, args.other_usd, digest_file(args.source),
+                    note=args.note,
+                )
+            elif not args.ledger.is_file():
+                raise ValueError("An existing project ledger is required; a missing ledger is not zero usage")
+            print(json.dumps(ledger.summary(), indent=2))
+            return 0
         if args.command == "prepare-prompts":
             from .preparation import prepare_local
             result = prepare_local(config, args.model_dir, args.corpus_jsonl, args.output)
@@ -85,7 +147,7 @@ def main(argv=None) -> int:
             return 0
         sources = read_json(args.config.parent / "sources.lock.json")
         engines = read_json(args.config.parent / "engines.lock.json")
-        problems = qualification_errors(sources, engines)
+        problems = qualification_errors(sources, engines, args.config.parent)
         if args.command == "plan":
             result = config.describe(phase=args.phase)
             result["qualification_pending"] = problems
@@ -107,6 +169,7 @@ def main(argv=None) -> int:
             if args.require_ready:
                 problems = measurement_errors(
                     config.data, sources, engines, git_identity(args.config.parent.parent),
+                    args.config.parent,
                 )
             if args.require_ready and problems:
                 raise ValueError("Not ready for formal runs: " + "; ".join(problems))

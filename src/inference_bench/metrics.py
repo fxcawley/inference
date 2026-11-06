@@ -109,8 +109,8 @@ AGGREGATE_METRICS = (
 )
 
 
-def aggregate(cells: list[dict], *, expected_repetitions: int) -> list[dict]:
-    """Select the first valid attempt, retain incomplete groups, never pool requests."""
+def select_attempts(cells: list[dict]) -> dict:
+    """The first valid attempt, otherwise the first attempt; never the fastest."""
     chosen = {}
     seen_attempts = set()
     for cell in sorted(cells, key=lambda c: c["attempt"]):
@@ -121,6 +121,45 @@ def aggregate(cells: list[dict], *, expected_repetitions: int) -> list[dict]:
         seen_attempts.add(attempt_key)
         if key not in chosen or (not chosen[key]["valid"] and cell["valid"]):
             chosen[key] = cell
+    return chosen
+
+
+RATIO_METRICS = ("output_tokens_per_s", "ttft_ms_p50", "ttft_ms_p95", "e2e_ms_p95")
+
+
+def paired_ratios(cells: list[dict], *, expected_repetitions: int) -> list[dict]:
+    """SGLang divided by vLLM within each matched profile/concurrency/repetition."""
+    chosen = select_attempts(cells)
+    groups = {}
+    for (engine, profile, concurrency, repetition), baseline in chosen.items():
+        other = chosen.get(("sglang", profile, concurrency, repetition))
+        if engine != "vllm" or not baseline["valid"] or not other or not other["valid"]:
+            continue
+        groups.setdefault((profile, concurrency), {})[repetition] = {
+            metric: other[metric] / baseline[metric]
+            if baseline[metric] and other[metric] is not None else None
+            for metric in RATIO_METRICS
+        }
+    result = []
+    for (profile, concurrency), repeats in sorted(groups.items()):
+        row = {
+            "profile": profile, "concurrency": concurrency, "matched_repetitions": len(repeats),
+            "complete": set(repeats) == set(range(1, expected_repetitions + 1)),
+        }
+        for metric in RATIO_METRICS:
+            values = [repeats[r][metric] for r in sorted(repeats) if repeats[r][metric] is not None]
+            for repetition in sorted(repeats):
+                row[f"{metric}_ratio_r{repetition}"] = repeats[repetition][metric]
+            row[f"{metric}_ratio_median"] = median(values) if values else None
+            row[f"{metric}_ratio_min"] = min(values) if values else None
+            row[f"{metric}_ratio_max"] = max(values) if values else None
+        result.append(row)
+    return result
+
+
+def aggregate(cells: list[dict], *, expected_repetitions: int) -> list[dict]:
+    """Select the first valid attempt, retain incomplete groups, never pool requests."""
+    chosen = select_attempts(cells)
     groups = {}
     for key, cell in chosen.items():
         groups.setdefault(key[:3], []).append(cell)

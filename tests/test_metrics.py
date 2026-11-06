@@ -80,6 +80,29 @@ class MetricTests(unittest.TestCase):
         result = aggregate(cells, expected_repetitions=3)[0]
         self.assertEqual(result["output_tokens_per_s_max"], 100000)
 
+    def test_paired_ratios_match_repetitions_and_use_first_valid_attempts(self):
+        from inference_bench.metrics import RATIO_METRICS, paired_ratios
+        def cell(engine, repetition, tps, attempt=1, valid=True):
+            return {
+                "engine": engine, "profile": "short", "concurrency": 4, "repetition": repetition,
+                "attempt": attempt, "valid": valid,
+                **{metric: tps if metric == "output_tokens_per_s" else 1000 / tps for metric in RATIO_METRICS},
+            }
+        cells = [cell("vllm", r, 100) for r in (1, 2, 3)] + [
+            cell("sglang", 1, 120), cell("sglang", 2, 50, valid=False),
+            cell("sglang", 2, 110, attempt=2), cell("sglang", 3, 90),
+        ]
+        row = paired_ratios(cells, expected_repetitions=3)[0]
+        self.assertEqual(row["matched_repetitions"], 3)
+        self.assertTrue(row["complete"])
+        self.assertAlmostEqual(row["output_tokens_per_s_ratio_r2"], 1.1)
+        self.assertAlmostEqual(row["output_tokens_per_s_ratio_median"], 1.1)
+        self.assertAlmostEqual(row["output_tokens_per_s_ratio_min"], 0.9)
+        self.assertAlmostEqual(row["e2e_ms_p95_ratio_max"], 100 / 90)
+        row = paired_ratios(cells[:-1], expected_repetitions=3)[0]
+        self.assertEqual((row["matched_repetitions"], row["complete"]), (2, False))
+        self.assertNotIn("output_tokens_per_s_ratio_r3", row)
+
     def test_mixed_phases_and_duplicate_ids_are_rejected(self):
         row = request("second")
         row["phase"] = "warmup"
@@ -107,6 +130,11 @@ class AnalysisTests(unittest.TestCase):
         claims = analyze(self.input, self.output, allow_synthetic=True)
         self.assertFalse(claims["publishable_measurements"])
         self.assertEqual(claims["failed_or_missing_attempts"], 0)
+        self.assertEqual(len(claims["paired_ratios"]), 6)
+        self.assertTrue(all(r["complete"] and r["matched_repetitions"] == 3 for r in claims["paired_ratios"]))
+        self.assertTrue(all(r["output_tokens_per_s_ratio_median"] < 1 for r in claims["paired_ratios"]))
+        self.assertTrue((self.output / "paired-ratios.csv").is_file())
+        self.assertIn("SGLang ÷ vLLM", (self.output / "tables.md").read_text(encoding="utf-8"))
         figures = list((self.output / "figures").glob("*.svg"))
         self.assertEqual(len(figures), 3)
         for path in figures:
@@ -229,12 +257,12 @@ class PilotAnalysisTests(unittest.TestCase):
     def test_forecast_requires_real_ledger_state_and_refuses_mid_campaign_resize(self):
         from inference_bench.budget import Ledger
         from inference_bench.planning import forecast_campaign
-        with self.assertRaisesRegex(ValueError, "existing campaign ledger"):
+        with self.assertRaisesRegex(ValueError, "existing project ledger"):
             forecast_campaign(self.input, self.root / "missing.json", allow_synthetic=True)
         manifest, config, _ = load_campaign(self.input, allow_synthetic=True)
         ledger_path = self.root / "working-ledger.json"
         ledger_path.write_bytes(self.ledger.read_bytes())
-        ledger = Ledger(ledger_path, manifest["campaign_id"], config)
+        ledger = Ledger(ledger_path, config)
         reservation = ledger.reserve("pilot", 60, now=0)
         report = forecast_campaign(self.input, ledger_path, allow_synthetic=True)
         self.assertIsNone(report["recommended_protocol"])
@@ -245,6 +273,26 @@ class PilotAnalysisTests(unittest.TestCase):
         report = forecast_campaign(self.input, ledger_path, allow_synthetic=True)
         self.assertIsNone(report["recommended_protocol"])
         self.assertTrue(any("cannot be resized" in reason for reason in report["blockers"]))
+
+    def test_forecast_applies_reconciled_billing_rate_to_candidate_costs(self):
+        from decimal import Decimal
+        from inference_bench.budget import Ledger
+        from inference_bench.planning import forecast_campaign
+        _, config, _ = load_campaign(self.input, allow_synthetic=True)
+        ledger_path = self.root / "billed-ledger.json"
+        ledger_path.write_bytes(self.ledger.read_bytes())
+        ledger = Ledger(ledger_path, config)
+        lease = ledger.reserve("pilot", 1000, now=0)
+        ledger.settle(lease["id"], 1000, confirmed_stopped=True)
+        billed = config.rate_per_second * 1000 * 2
+        ledger.record_billing(1500, str(billed), "0", "c" * 64, now=2000)
+        report = forecast_campaign(self.input, ledger_path, allow_synthetic=True)
+        self.assertEqual(report["basis"]["billing_rate_multiplier"], "2")
+        for candidate in report["candidates"]:
+            self.assertEqual(
+                Decimal(candidate["projected_container_usd"]),
+                2 * Decimal(candidate["nominal_container_usd"]),
+            )
 
     def test_forecast_rejects_missing_warmup_and_inconsistent_block_timing(self):
         from inference_bench.planning import forecast_campaign

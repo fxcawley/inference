@@ -10,6 +10,8 @@ Implementation choices for the offline stage: HTTPX 0.28.1 supplies the common s
 
 The November 2 offline continuation implemented the bounded pilot schedule and separate inputs, artifact-based cost forecasts for the four agreed protocol sizes, and read-only recovery planning with persistent budget/attempt checks. `planning.py` provides these local plans; it does not dispatch remote calls. See the runbook for commands, evidence requirements, and the forecast's overhead assumptions.
 
+A later offline secondary assessment kept the agreed compact-protocol order. It added executable conformance probes, qualification reports that the formal gate verifies, a project ledger shared by pilot and formal campaigns, conservative billing reconciliation, and paired engine ratios. The runbook's [secondary assessment](runbook.md#secondary-assessment) records the findings and the adapter decisions that remain open.
+
 The project decisions are:
 
 | Question | Decision |

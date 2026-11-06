@@ -124,6 +124,7 @@ def campaign_phase(manifest: dict) -> str:
 def create_campaign(
     root: Path, config, sources: dict, engines: dict, *, campaign_id: str,
     evidence_kind: str, harness: dict, phase: str | None = None,
+    qualification_base: Path | None = None,
 ) -> dict:
     if evidence_kind not in ("measurement", "pilot", "synthetic"):
         raise ValueError("Unknown evidence kind")
@@ -133,7 +134,9 @@ def create_campaign(
     })
     harness = {**harness, "source_sha256": source_tree_hash()}
     if evidence_kind == "measurement":
-        problems = measurement_errors(config.data, sources, engines, harness)
+        if qualification_base is None:
+            raise ValueError("Formal campaigns require the directory containing qualification reports")
+        problems = measurement_errors(config.data, sources, engines, harness, qualification_base)
         if problems:
             raise ValueError("Formal campaign is not ready: " + "; ".join(problems))
     root = Path(root)
@@ -153,6 +156,13 @@ def create_campaign(
     write_json(root / "protocol.json", config.data)
     write_json(root / "sources.lock.json", sources)
     write_json(root / "engines.lock.json", engines)
+    if evidence_kind == "measurement":
+        # Keep the verified reports beside the locks so offline analysis can recheck them.
+        for record in engines["engines"].values():
+            relative = record["qualification"]["report"]
+            atomic_write(
+                safe_path(root, relative), safe_path(Path(qualification_base), relative).read_bytes(),
+            )
     return manifest
 
 

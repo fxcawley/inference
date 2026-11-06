@@ -16,6 +16,7 @@ from .artifacts import seal, write_json, write_jsonl
 from .client import http_client, run_cell
 from .config import Cell, Config
 from .provenance import environment, source_tree_hash
+from .qualification import evaluate_probe, select_probes
 from .workloads import sampling_seed, select_prompts
 
 
@@ -171,6 +172,31 @@ async def _sample_gpu(rows: list[dict]):
         await asyncio.sleep(1)
 
 
+async def _conformance(
+    directory: Path, config: Config, origin: str, client, probes: list[tuple[dict, dict]], context: dict,
+) -> None:
+    """Untimed C=1 probes; stop before measured work if behavior is wrong."""
+    records, events, results = [], [], []
+    for probe, prompt in probes:
+        result = await run_cell(
+            origin, [prompt], concurrency=1, output_tokens=probe["max_tokens"],
+            seed=sampling_seed(config.experiment["seed"], probe["name"], 0, "conformance"),
+            timeout_s=config.experiment["request_timeout_s"], phase="conformance",
+            context={**context, "probe_name": probe["name"]}, client=client,
+            ignore_eos=probe["ignore_eos"],
+            stop_token_ids=None if probe["ignore_eos"] else prompt["stop_token_ids"],
+        )
+        records.extend(result["records"])
+        events.extend(result["events"])
+        results.append(evaluate_probe(result["records"][0], probe))
+    write_jsonl(directory / "conformance" / "requests.jsonl.gz", records)
+    write_jsonl(directory / "conformance" / "stream-events.jsonl.gz", events)
+    write_json(directory / "conformance" / "checks.json", results)
+    failed = [r["name"] for r in results if r["status"] != "passed"]
+    if failed:
+        raise RuntimeError("Conformance probes failed: " + ", ".join(failed))
+
+
 async def run_block(
     directory: Path, config: Config, *, engine: str, model_path: str,
     cells: list[Cell], prompts: list[dict], context: dict, deadline_unix: float,
@@ -192,6 +218,20 @@ async def run_block(
     deadline.check()
     if context.get("harness_sha256") != source_tree_hash():
         raise ValueError("Worker harness source differs from the frozen campaign")
+    # Resolve every input before paying for hardware inspection or model startup.
+    probes = select_probes(prompts)
+    warmup_phase = "pilot_warmup" if phase == "pilot" else "warmup"
+    planned = [
+        (
+            cell,
+            select_prompts(prompts, cell.profile, cell.repetition, warmup_phase, config.warmup_count(cell.concurrency)),
+            select_prompts(
+                prompts, cell.profile, cell.repetition, phase,
+                config.request_count(cell.concurrency, phase=phase),
+            ),
+        )
+        for cell in cells
+    ]
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     history = []
@@ -224,11 +264,14 @@ async def run_block(
             async with asyncio.timeout(deadline.remaining()):
                 async with http_client(config.experiment["max_running_requests"]) as client:
                     origin = f"http://127.0.0.1:{port}"
-                    await wait_ready(client, origin, server, config.experiment["ready_timeout_s"])
+                    models = await wait_ready(client, origin, server, config.experiment["ready_timeout_s"])
                     timing["ready_ns"] = time.perf_counter_ns()
+                    write_json(directory / "models.json", models)
                     transition("ready")
                     sampler = asyncio.create_task(_sample_gpu(samples))
-                    for cell in cells:
+                    await _conformance(directory, config, origin, client, probes, context)
+                    transition("conformance_passed")
+                    for cell, warmup, measured in planned:
                         server.check()
                         metadata = {**context, **cell.to_dict(), "cell_id": cell.key}
                         cell_dir = directory / "cells" / f"{cell.profile}-c{cell.concurrency}"
@@ -236,11 +279,6 @@ async def run_block(
                         write_json(cell_dir / "manifest.json", metadata)
                         write_json(cell_dir / "status.json", {"status": "interrupted"})
                         shape = config.profiles[cell.profile]
-                        warmup_n = config.warmup_count(cell.concurrency)
-                        warmup_phase = "pilot_warmup" if phase == "pilot" else "warmup"
-                        warmup = select_prompts(
-                            prompts, cell.profile, cell.repetition, warmup_phase, warmup_n,
-                        )
                         transition("warming")
                         warmed = await run_cell(
                             origin, warmup, concurrency=cell.concurrency,
@@ -252,10 +290,6 @@ async def run_block(
                         write_jsonl(cell_dir / "warmup.jsonl.gz", warmed["records"])
                         if not warmed["summary"]["valid"]:
                             raise RuntimeError("Warmup failed; measured work was not started")
-                        measured = select_prompts(
-                            prompts, cell.profile, cell.repetition, phase,
-                            config.request_count(cell.concurrency, phase=phase),
-                        )
                         transition("measuring")
                         result = await run_cell(
                             origin, measured, concurrency=cell.concurrency,

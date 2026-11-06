@@ -27,12 +27,12 @@ class BudgetTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "ledger.json"
         self.config = load_config(ROOT / "configs/benchmark.toml")
-        self.ledger = Ledger(self.path, "campaign", self.config)
+        self.ledger = Ledger(self.path, self.config)
 
     def test_unresolved_call_survives_restart_and_holds_full_reservation(self):
         lease = self.ledger.reserve("pilot", 600, now=0)
         self.ledger.attach_call(lease["id"], "recorded-call")
-        resumed = Ledger(self.path, "campaign", self.config)
+        resumed = Ledger(self.path, self.config)
         self.assertEqual(resumed.summary()["exposure_seconds"], 600)
         with self.assertRaises(BudgetError):
             resumed.reserve("formal", 1, now=10_000_000)
@@ -60,14 +60,74 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaises(BudgetError):
             self.ledger.reserve("formal", 10)
 
-    def test_policy_or_campaign_change_cannot_reset_usage(self):
-        self.ledger.reserve("pilot", 10)
-        with self.assertRaises(BudgetError):
-            Ledger(self.path, "another-campaign", self.config).summary()
+    def test_pilot_and_formal_protocols_share_one_ledger_but_policy_cannot_reset(self):
+        from inference_bench.planning import protocol_candidates
+        lease = self.ledger.reserve("pilot", 10)
+        self.ledger.settle(lease["id"], 10, confirmed_stopped=True)
+        for _, compact in protocol_candidates(self.config):
+            self.assertEqual(Ledger(self.path, compact).summary()["exposure_seconds"], 10)
+        for section, key, value in (
+            ("budget", "ledger_id", "another-ledger"), ("budget", "total_usd", 76),
+            ("pricing", "gpu_per_second", 0.001),
+        ):
+            with self.subTest(key=key):
+                data = copy.deepcopy(self.config.data)
+                data[section][key] = value
+                with self.assertRaises(BudgetError):
+                    Ledger(self.path, Config(data)).summary()
+
+    def test_billing_can_only_increase_exposure_and_scales_later_reservations(self):
+        lease = self.ledger.reserve("pilot", 1000, now=0)
+        self.ledger.settle(lease["id"], 1000, confirmed_stopped=True)
+        charged = self.config.rate_per_second * 1000
+        self.ledger.record_billing(2000, str(charged / 2), "1", "a" * 64, now=3000)
+        summary = self.ledger.summary()
+        self.assertEqual(Decimal(summary["exposure_usd"]), charged)
+        self.assertEqual(Decimal(summary["billing"]["rate_multiplier"]), 1)
+        self.ledger.record_billing(2500, str(charged * Decimal("1.5")), "1", "b" * 64, now=3000)
+        summary = self.ledger.summary()
+        self.assertEqual(Decimal(summary["exposure_usd"]), charged * Decimal("1.5"))
+        self.assertEqual(Decimal(summary["billing"]["rate_multiplier"]), Decimal("1.5"))
+        self.assertTrue(summary["warnings"])
+        # 23,900 seconds fits at list price, but not at the reconciled 1.5x effective rate.
         data = copy.deepcopy(self.config.data)
-        data["budget"]["total_usd"] = 76
+        data["experiment"]["block_timeout_s"] = 40000
+        wide = Config(data)
+        with self.assertRaisesRegex(BudgetError, "allocation exceeded"):
+            Ledger(self.path, wide).reserve("formal", 23900, now=4000)
+        Ledger(self.path.with_name("unreconciled.json"), wide).reserve("formal", 23900, now=4000)
+
+    def test_billing_period_cannot_split_a_lease_or_skip_an_unsettled_call(self):
+        lease = self.ledger.reserve("pilot", 600, now=100)
+        with self.assertRaisesRegex(BudgetError, "inside a lease"):
+            self.ledger.record_billing(400, "0", "0", "a" * 64, now=1000)
+        with self.assertRaisesRegex(BudgetError, "Settle every call"):
+            self.ledger.record_billing(800, "0", "0", "a" * 64, now=1000)
+        self.ledger.settle(lease["id"], 500, confirmed_stopped=True)
+        self.ledger.record_billing(800, "1", "0.5", "a" * 64, now=1000)
+        with self.assertRaisesRegex(BudgetError, "reconciled billing period"):
+            self.ledger.reserve("pilot", 10, now=700)
+        for through, gpu, other, digest in (
+            (900, "0.9", "0.5", "b" * 64), (700, "2", "1", "b" * 64), (900, "2", "1", "not-a-hash"),
+            (2000, "2", "1", "b" * 64), (900, "-1", "1", "b" * 64), (900, "NaN", "1", "b" * 64),
+        ):
+            with self.subTest(through=through, gpu=gpu, digest=digest):
+                with self.assertRaises(BudgetError):
+                    self.ledger.record_billing(through, gpu, other, digest, now=1000)
+        data = self.ledger.read()
+        data["billing"][0]["gpu_container_usd"] = "-5"
+        write_json(self.path, data)
         with self.assertRaises(BudgetError):
-            Ledger(self.path, "campaign", Config(data)).summary()
+            self.ledger.summary()
+
+    def test_other_costs_beyond_their_allocation_consume_the_reserve(self):
+        before = Decimal(self.ledger.summary()["remaining"]["gpu_container_usd"])
+        self.ledger.record_billing(10, "0", "4", "a" * 64, now=20)
+        self.assertEqual(Decimal(self.ledger.summary()["remaining"]["gpu_container_usd"]), before)
+        self.ledger.record_billing(11, "0", "8", "b" * 64, now=20)
+        summary = self.ledger.summary()
+        self.assertEqual(Decimal(summary["remaining"]["gpu_container_usd"]), before - 3)
+        self.assertTrue(any("reserve" in warning for warning in summary["warnings"]))
 
     def test_second_controller_lock_is_rejected(self):
         with self.ledger._exclusive():
@@ -113,7 +173,7 @@ class RecoveryTests(unittest.TestCase):
             read_json(ROOT / "configs/engines.lock.json"),
         )
         self.config = Config(read_json(self.root / "protocol.json"))
-        self.ledger = Ledger(self.parent / "ledger.json", self.manifest["campaign_id"], self.config)
+        self.ledger = Ledger(self.parent / "ledger.json", self.config)
         write_json(self.ledger.path, self.ledger.read())
         self.cell = self.root / "runs/vllm/r1/attempt-1/cells/short-c1"
         self.missing = self.root / "runs/vllm/r1/attempt-1/cells/prefill-c4"
@@ -230,7 +290,7 @@ class RecoveryTests(unittest.TestCase):
             result = self.plan()
         self.assertEqual(result["eligible_cells"], [])
         self.assertTrue(any("harness source differs" in reason for reason in result["blockers"]))
-        with self.assertRaisesRegex(BudgetError, "existing campaign ledger"):
+        with self.assertRaisesRegex(BudgetError, "existing project ledger"):
             resume_plan(self.root, self.parent / "missing-ledger.json", allow_synthetic=True)
         self.assertFalse((self.parent / "missing-ledger.json").exists())
 
@@ -373,50 +433,144 @@ class ProcessTests(unittest.TestCase):
             safe_path(self.root, "link/file")
 
 
-class BlockTests(unittest.IsolatedAsyncioTestCase):
-    async def test_pilot_uses_separate_inputs_and_records_block_timings_without_network(self):
-        config = load_config(ROOT / "configs/benchmark.toml")
-        cell = next(c for c in config.cells(phase="pilot") if c.engine == "vllm" and c.concurrency == 4)
-        prompts = [
-            {"profile": cell.profile, "repetition": 1, "phase": phase, "request_id": f"{phase}-{i}"}
-            for phase, count in (("pilot", 16), ("pilot_warmup", 8), ("measurement", 256))
-            for i in range(count)
-        ]
+def probe_prompts(stops=(1,)):
+    from inference_bench.qualification import PROBES
+    return [
+        {
+            "request_id": f'conformance:{p["name"]}', "probe_name": p["name"], "phase": "conformance",
+            "profile": None, "repetition": None, "prompt_ids": [5, 6], "stop_token_ids": list(stops),
+        }
+        for p in PROBES
+    ]
 
+
+def probe_result(prompt, *, broken=None, **kwargs):
+    """Conformance replies from a fake server double; no socket is opened."""
+    from inference_bench.qualification import PROBE_BY_NAME
+    probe = PROBE_BY_NAME[kwargs["context"]["probe_name"]]
+    honored = not kwargs["ignore_eos"]
+    text = {"arithmetic": "42", "capital": "Paris", "eos_honored": "yes"}.get(
+        probe["name"], "A plain sentence that summarizes several distinct details of the passage for readers.",
+    )
+    record = {
+        **kwargs["context"], "status": "success", "requested_output_tokens": probe["max_tokens"],
+        "finish_reason": "stop" if honored else "length",
+        "actual_output_tokens": 3 if honored else probe["max_tokens"], "response_text": text,
+    }
+    if probe["name"] == broken:
+        record.update(response_text="\ufffd\ufffd", finish_reason="length", actual_output_tokens=probe["max_tokens"])
+    return {"records": [record], "events": [], "summary": None}
+
+
+class BlockTests(unittest.IsolatedAsyncioTestCase):
+    def fake_engine(self, broken=None):
         @asynccontextmanager
         async def fake_client(*args):
             yield object()
 
-        result = {
-            "records": [], "events": [], "summary": {"valid": True},
-            "client_loop_lag_ms": [], "client_lag_interval_ms": 10,
-        }
+        cells = []
+
+        async def fake_run_cell(origin, prompts, **kwargs):
+            if kwargs["phase"] == "conformance":
+                self.assertEqual(kwargs["ignore_eos"], kwargs["stop_token_ids"] is None)
+                return probe_result(prompts[0], broken=broken, **kwargs)
+            cells.append((prompts, kwargs))
+            return {
+                "records": [], "events": [], "summary": {"valid": True},
+                "client_loop_lag_ms": [], "client_lag_interval_ms": 10,
+            }
+
+        patches = (
+            patch("inference_bench.runner.engines.inspect_hardware", return_value=[]),
+            patch("inference_bench.runner.ProcessGroup"),
+            patch("inference_bench.runner.http_client", fake_client),
+            patch("inference_bench.runner.wait_ready", new_callable=AsyncMock,
+                  return_value={"data": [{"id": "gemma4-bench"}]}),
+            patch("inference_bench.runner._sample_gpu", new_callable=AsyncMock),
+            patch("inference_bench.runner.run_cell", fake_run_cell),
+        )
+        return patches, cells
+
+    async def test_pilot_uses_separate_inputs_and_records_block_timings_without_network(self):
+        config = load_config(ROOT / "configs/benchmark.toml")
+        cell = next(c for c in config.cells(phase="pilot") if c.engine == "vllm" and c.concurrency == 4)
+        prompts = probe_prompts() + [
+            {"profile": cell.profile, "repetition": 1, "phase": phase, "request_id": f"{phase}-{i}"}
+            for phase, count in (("pilot", 16), ("pilot_warmup", 8), ("measurement", 256))
+            for i in range(count)
+        ]
+        patches, calls = self.fake_engine()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "pilot"
-            with (
-                patch("inference_bench.runner.engines.inspect_hardware", return_value=[]),
-                patch("inference_bench.runner.ProcessGroup"),
-                patch("inference_bench.runner.http_client", fake_client),
-                patch("inference_bench.runner.wait_ready", new_callable=AsyncMock),
-                patch("inference_bench.runner._sample_gpu", new_callable=AsyncMock),
-                patch("inference_bench.runner.run_cell", new_callable=AsyncMock, return_value=result) as run,
-            ):
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
                 await run_block(
                     root, config, engine="vllm", model_path="/unused", cells=[cell], prompts=prompts,
                     context={"evidence_kind": "synthetic", "harness_sha256": source_tree_hash()},
                     deadline_unix=time.time() + 90, phase="pilot",
                 )
-            self.assertEqual(run.await_count, 2)
-            warmup, measured = run.await_args_list
-            self.assertEqual(len(warmup.args[1]), 8)
-            self.assertEqual(len(measured.args[1]), 16)
-            self.assertTrue(all(p["phase"] == "pilot_warmup" for p in warmup.args[1]))
-            self.assertTrue(all(p["phase"] == "pilot" for p in measured.args[1]))
-            self.assertEqual(measured.kwargs["phase"], "pilot")
+            self.assertEqual(len(calls), 2)
+            (warmup, _), (measured, measured_kwargs) = calls
+            self.assertEqual(len(warmup), 8)
+            self.assertEqual(len(measured), 16)
+            self.assertTrue(all(p["phase"] == "pilot_warmup" for p in warmup))
+            self.assertTrue(all(p["phase"] == "pilot" for p in measured))
+            self.assertEqual(measured_kwargs["phase"], "pilot")
+            checks = read_json(root / "conformance/checks.json")
+            self.assertEqual([c["status"] for c in checks], ["passed"] * 5)
+            self.assertEqual(read_json(root / "models.json")["data"][0]["id"], "gemma4-bench")
+            states = [h["state"] for h in read_json(root / "status.json")["history"]]
+            self.assertLess(states.index("conformance_passed"), states.index("warming"))
             timing = read_json(root / "timing.json")
             self.assertLessEqual(timing["started_ns"], timing["ready_ns"])
             self.assertLessEqual(timing["ready_ns"], timing["finished_ns"])
             verify(root)
+
+    async def test_failed_probe_stops_block_before_warmup_or_measurement(self):
+        config = load_config(ROOT / "configs/benchmark.toml")
+        cell = next(c for c in config.cells(phase="pilot") if c.engine == "sglang")
+        prompts = probe_prompts() + [
+            {"profile": cell.profile, "repetition": 1, "phase": phase, "request_id": f"{phase}-{i}"}
+            for phase, count in (("pilot", 64), ("pilot_warmup", 64)) for i in range(count)
+        ]
+        patches, calls = self.fake_engine(broken="passage_summary")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "pilot"
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                with self.assertRaisesRegex(RuntimeError, "passage_summary"):
+                    await run_block(
+                        root, config, engine="sglang", model_path="/unused", cells=[cell],
+                        prompts=prompts, phase="pilot", deadline_unix=time.time() + 90,
+                        context={"evidence_kind": "pilot", "harness_sha256": source_tree_hash()},
+                    )
+            self.assertEqual(calls, [])
+            self.assertFalse((root / "cells").exists())
+            checks = {c["name"]: c["status"] for c in read_json(root / "conformance/checks.json")}
+            self.assertEqual(checks["passage_summary"], "failed")
+            self.assertEqual(read_json(root / "status.json")["state"], "failed")
+            verify(root)
+
+    async def test_missing_inputs_are_rejected_before_any_artifact_or_hardware_check(self):
+        config = load_config(ROOT / "configs/benchmark.toml")
+        cell = config.cells()[0]
+        complete = probe_prompts() + [
+            {"profile": cell.profile, "repetition": cell.repetition, "phase": phase, "request_id": f"{phase}-{i}"}
+            for phase, count in (("measurement", 256), ("warmup", 64)) for i in range(count)
+        ]
+        for prompts, message in (
+            (complete[1:], "every conformance probe"),
+            (probe_prompts(stops=()) + complete[5:], "stop token"),
+            ([p for p in complete if p["request_id"] != "measurement-255"], "cannot supply"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                with patch("inference_bench.runner.engines.inspect_hardware") as probe:
+                    with self.assertRaisesRegex(ValueError, message):
+                        await run_block(
+                            Path(directory) / "block", config, engine=cell.engine, model_path="/unused",
+                            cells=[cell], prompts=prompts, deadline_unix=time.time() + 90,
+                            context={"harness_sha256": source_tree_hash()},
+                        )
+                    probe.assert_not_called()
+                self.assertFalse((Path(directory) / "block").exists())
 
     async def test_changed_harness_is_rejected_before_hardware_or_model_start(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -449,17 +603,22 @@ class BlockTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "block"
             config = load_config(ROOT / "configs/benchmark.toml")
+            cell = config.cells()[0]
+            prompts = probe_prompts() + [
+                {"profile": cell.profile, "repetition": cell.repetition, "phase": phase, "request_id": f"{phase}-{i}"}
+                for phase, count in (("measurement", 256), ("warmup", 64)) for i in range(count)
+            ]
             with patch("inference_bench.runner.engines.inspect_hardware", side_effect=ValueError("wrong GPU")):
                 with self.assertRaisesRegex(ValueError, "wrong GPU"):
                     await run_block(
-                        root, config, engine="vllm", model_path="/models/not-loaded",
-                        cells=[config.cells()[0]], prompts=[],
+                        root, config, engine=cell.engine, model_path="/models/not-loaded",
+                        cells=[cell], prompts=prompts,
                         context={"attempt": 1, "harness_sha256": source_tree_hash()},
                         deadline_unix=time.time() + 90,
                     )
             verify(root)
             self.assertEqual(read_json(root / "status.json")["state"], "failed")
-            self.assertEqual(read_json(root / "manifest.json")["engine"], "vllm")
+            self.assertEqual(read_json(root / "manifest.json")["engine"], cell.engine)
 
     async def test_readiness_does_not_swallow_programming_errors(self):
         class Server:

@@ -24,7 +24,7 @@ SECTIONS = {
         "gpu", "cpu_cores", "memory_mib", "dtype", "kv_cache_dtype", "memory_fraction",
     },
     "budget": {
-        "total_usd", "gpu_container_usd", "other_usd", "reserve_usd", "max_gpu_seconds",
+        "ledger_id", "total_usd", "gpu_container_usd", "other_usd", "reserve_usd", "max_gpu_seconds",
         "pilot_seconds", "formal_seconds", "rerun_seconds",
     },
     "pricing": {
@@ -106,7 +106,12 @@ class Config:
         if h["memory_fraction"] >= 1:
             raise ValueError("Memory fraction must be less than one")
         for key, value in b.items():
-            _number(value, key, integer=key.endswith("seconds"), minimum=0)
+            if key == "ledger_id":
+                # Pilot and formal campaigns share this persistent project allowance.
+                if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{2,63}", value):
+                    raise ValueError("ledger_id must be a short lowercase identifier")
+            else:
+                _number(value, key, integer=key.endswith("seconds"), minimum=0)
         if sum(Decimal(str(b[k])) for k in ("gpu_container_usd", "other_usd", "reserve_usd")) > Decimal(str(b["total_usd"])):
             raise ValueError("Stage allocations exceed total budget")
         if sum(b[f"{stage}_seconds"] for stage in ("pilot", "formal", "rerun")) > b["max_gpu_seconds"]:

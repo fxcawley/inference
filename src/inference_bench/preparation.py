@@ -89,6 +89,27 @@ def download_model(source: dict, directory: Path) -> dict:
     return {**source, **inspect_model(directory)}
 
 
+def stop_token_ids(model_directory: Path, tokenizer) -> tuple[list[int], list[str]]:
+    """Probe stop IDs come from the pinned snapshot, not either server's defaults."""
+    ids, sources = set(), []
+    path = Path(model_directory) / "generation_config.json"
+    if path.is_file():
+        value = read_json(path).get("eos_token_id")
+        values = value if isinstance(value, list) else [] if value is None else [value]
+        if any(type(i) is not int or i < 0 for i in values):
+            raise ValueError("generation_config.json has an invalid eos_token_id")
+        if values:
+            ids.update(values)
+            sources.append("generation_config.json")
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if type(eos) is int and eos >= 0:
+        ids.add(eos)
+        sources.append("tokenizer")
+    if not ids:
+        raise ValueError("The model snapshot does not identify any stop token")
+    return sorted(ids), sources
+
+
 def prepare_local(
     config: Config, model_directory: Path, corpus_file: Path, output: Path, *, tokenizer=None,
 ) -> dict:
@@ -107,8 +128,12 @@ def prepare_local(
     if any(not isinstance(row, dict) or not isinstance(row.get("text"), str) for row in rows):
         raise ValueError("Corpus JSONL must contain objects with a text field")
     tokens, offsets = tokenize_corpus([row["text"] for row in rows], tokenizer)
-    prompts, manifest = prepare_prompts(config, tokens, tokenizer)
-    manifest.update(corpus_file_sha256=digest_file(corpus_file), source_offsets_sha256=digest_json(offsets))
+    stops, stop_sources = stop_token_ids(model_directory, tokenizer)
+    prompts, manifest = prepare_prompts(config, tokens, tokenizer, stop_token_ids=stops)
+    manifest.update(
+        corpus_file_sha256=digest_file(corpus_file), source_offsets_sha256=digest_json(offsets),
+        stop_token_sources=stop_sources,
+    )
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "manifest.json", manifest)
@@ -117,5 +142,6 @@ def prepare_local(
     write_jsonl(output / "warmup.jsonl.gz", (p for p in prompts if p["phase"] == "warmup"))
     write_jsonl(output / "pilot.jsonl.gz", (p for p in prompts if p["phase"] == "pilot"))
     write_jsonl(output / "pilot-warmup.jsonl.gz", (p for p in prompts if p["phase"] == "pilot_warmup"))
+    write_jsonl(output / "conformance.jsonl.gz", (p for p in prompts if p["phase"] == "conformance"))
     seal(output)
     return manifest

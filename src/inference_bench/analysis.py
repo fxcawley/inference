@@ -11,7 +11,7 @@ from .artifacts import (
     IDENTITY_FIELDS, atomic_write, campaign_phase, read_jsonl, safe_path, verify, write_json,
 )
 from .config import Cell, Config
-from .metrics import AGGREGATE_METRICS, aggregate, summarize
+from .metrics import AGGREGATE_METRICS, aggregate, paired_ratios, summarize
 from .provenance import digest_json, is_hash, measurement_errors, read_json
 
 
@@ -65,7 +65,7 @@ def load_campaign(
     if not is_hash(manifest.get("harness", {}).get("source_sha256")):
         raise ValueError("Campaign lacks its frozen harness source identity")
     if kind == "measurement":
-        problems = measurement_errors(config.data, sources, engines, manifest.get("harness", {}))
+        problems = measurement_errors(config.data, sources, engines, manifest.get("harness", {}), root)
         if problems:
             raise ValueError("Unqualified measurement bundle: " + "; ".join(problems))
     identities = {
@@ -269,9 +269,11 @@ def analyze(root: Path, output: Path, *, allow_synthetic: bool = False) -> dict:
         group["container_usd_per_million_output_tokens"] = (
             1_000_000 * float(config.rate_per_second) / throughput if throughput else None
         )
+    ratios = paired_ratios(cells, expected_repetitions=repetitions)
     output.mkdir(parents=True, exist_ok=True)
     _csv(output / "cells.csv", cells)
     _csv(output / "aggregate.csv", groups)
+    _csv(output / "paired-ratios.csv", ratios)
     failures = [c for c in cells if not c["valid"]]
     _csv(output / "failures.csv", failures)
     kind = manifest["evidence_kind"]
@@ -298,6 +300,12 @@ def analyze(root: Path, output: Path, *, allow_synthetic: bool = False) -> dict:
         "protocol_sha256": manifest["protocol_sha256"],
         "publishable_measurements": kind == "measurement" and all(g["complete"] for g in groups),
         "failed_or_missing_attempts": len(failures), "groups": groups,
+        "paired_ratios": ratios,
+        "ratio_definition": (
+            "SGLang divided by vLLM within each matched profile, concurrency, and repetition; "
+            "the engines ran in separate allocations. Above 1 means higher SGLang throughput "
+            "or higher SGLang latency."
+        ),
         "uncertainty": "median and minimum–maximum of repetition-level metrics; not a confidence interval",
         "observed_project_cost_usd": None,
     }
@@ -314,6 +322,23 @@ def analyze(root: Path, output: Path, *, allow_synthetic: bool = False) -> dict:
             f'| {group["engine"]} | {group["profile"]} | {group["concurrency"]} | '
             f'{group["valid_repetitions"]} | {display("output_tokens_per_s")} | '
             f'{display("ttft_ms_p95")} | {display("e2e_ms_p95")} |'
+        )
+    table.extend([
+        "", "## SGLang ÷ vLLM, matched by repetition", "",
+        "| Profile | C | Matched repetitions | Output tok/s ratio, median (range) | p95 E2E ratio, median (range) |",
+        "|---|---:|---:|---|---|",
+    ])
+    for row in ratios:
+        def ratio(metric):
+            if row[f"{metric}_ratio_median"] is None:
+                return "—"
+            return (
+                f'{row[f"{metric}_ratio_median"]:.3f} '
+                f'({row[f"{metric}_ratio_min"]:.3f}–{row[f"{metric}_ratio_max"]:.3f})'
+            )
+        table.append(
+            f'| {row["profile"]} | {row["concurrency"]} | {row["matched_repetitions"]} | '
+            f'{ratio("output_tokens_per_s")} | {ratio("e2e_ms_p95")} |'
         )
     table.extend(["", "Costs in aggregate.csv are derived list-price estimates. Actual billed project cost remains unreconciled.", ""])
     atomic_write(output / "tables.md", "\n".join(table).encode("utf-8"))

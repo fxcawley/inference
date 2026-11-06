@@ -12,13 +12,19 @@ Corpus normalization applies Unicode NFC, collapses whitespace, and omits empty 
 
 The request uses integer prompt IDs, fixed output length, temperature 0, top-p 1, no penalties, one output, streaming, ignored EOS, and visible special tokens. Prefix reuse and speculative decoding are disabled by the candidate engine commands. Actual server behavior still requires the pilot.
 
+Every input/output pair has the same length within a cell, and all workers start together. At C≥4 requests therefore run as synchronized waves: a wave prefills together, decodes together, and finishes together before the next wave starts. The results describe this burst-like closed-loop load, not staggered production arrivals. High-concurrency TTFT largely reflects how each engine prefills a full wave, including its released chunked-prefill and batch-token defaults. Report those resolved settings and this limitation beside the results.
+
 The sampling-seed base is the first seven hexadecimal digits of a canonical SHA-256 hash of the global seed, profile, repetition, and phase. The client adds the request ordinal. Engine and concurrency do not enter that derivation.
+
+## Conformance probes
+
+Each block runs five untimed C=1 probes after readiness and before warmup: EOS honored, EOS ignored at a fixed 64 tokens, a simple arithmetic answer, a simple factual answer, and a plausible passage summary. Probes use the common client and request body. Only the EOS-honoring probes set `ignore_eos` false; they send stop IDs from the pinned model snapshot instead of relying on either server's generation defaults. A failed probe stops the block before warmup or measurement. The probes check basic serving behavior and token accounting; they are not an accuracy comparison.
 
 ## Pilot and protocol selection
 
 The pilot has one repetition per engine and all twelve profile/concurrency pairs. Each cell uses `max(16, 2*C)` timed requests and the configured common warmup. Its prompt IDs and seeds are separate from formal measurement and formal warmup. The default pilot contains 768 timed and 672 warmup requests; conformance probes are additional.
 
-Forecasting requires complete, valid pilot and warmup records for both engines, checked block timings, and the existing campaign budget. For every retained profile/concurrency pair, use the slower engine's seconds per request and warmup duration. Scale measured time by the formal request count. Use the maximum observed startup and noncell overhead across engines; scale noncell overhead up with the total request volume, including warmup, and never down. Add 210 seconds per fresh block for container initialization and final shutdown/commit work outside the runner's timing. Apply 25% headroom to the whole block and round up to seconds.
+Forecasting requires complete, valid pilot and warmup records for both engines, checked block timings, and the existing project ledger. For every retained profile/concurrency pair, use the slower engine's seconds per request and warmup duration. Scale measured time by the formal request count. Use the maximum observed startup and noncell overhead across engines; scale noncell overhead up with the total request volume, including warmup, and never down. Add 210 seconds per fresh block for container initialization and final shutdown/commit work outside the runner's timing. Apply 25% headroom to the whole block and round up to seconds.
 
 Evaluate the full matrix, dropping C=32, retaining only `short`/`prefill`, and finally reducing to 200 requests per cell, in that order. Both engines and three repetitions remain mandatory. Check block, stage, campaign-time, and dollar limits before recommending a configuration. Formal measurements cannot trigger a later protocol reduction. If the smallest agreed study does not fit, stop after the pilot. Forecasts use finite-batch pilot observations and are estimates; absolute deadlines and the persistent ledger supply the execution bounds.
 
@@ -52,6 +58,10 @@ The first request failure stops further assignment; already active requests drai
 
 Latency p50/p95 use linear interpolation within each repetition. Reports then show the median and minimum–maximum of the three repetition-level metrics. This range is run-to-run spread, not a confidence interval. No token-level ITL or p99 claims are produced.
 
+Engine ratios are SGLang ÷ vLLM within each matched profile, concurrency, and repetition, using each side's first valid attempt. `paired-ratios.csv` lists every repetition's ratio and their median and range for output throughput, p50/p95 TTFT, and p95 E2E latency. Above 1 means higher SGLang throughput or higher SGLang latency. A repetition pair ran adjacently in separate allocations, not on one GPU, so the pairing reduces drift but does not remove host variation.
+
+Equal memory-fraction settings do not imply equal KV capacity. At C=32, the 4,096/128 shape needs 135,168 concurrent tokens. Qualification records each engine's reported KV capacity when its log exposes it; cells where capacity may bind should be described as such.
+
 ## Artifact and analysis validity
 
 Atomic files, SHA-256 manifests, and completion markers distinguish durable bundles from partial writes. A completion marker proves file integrity, not experimental success; each cell separately records valid/failed/interrupted status.
@@ -68,6 +78,6 @@ Synthetic fixtures require explicit analysis/export opt-in, carry visible labels
 
 The proposed H200, eight-core, 128-GiB container costs $5.939856/hour at the dated planning rates. `aggregate.csv` derives GPU-only and requested-container dollars per million output tokens from those rates and observed throughput.
 
-Those estimates are distinct from actual project expenditure. The latter remains null until reconciled with Modal, including preparation, startup, warmup, retries, failures, storage, and export.
+Those estimates are distinct from actual project expenditure. The latter remains null until reconciled with Modal, including preparation, startup, warmup, retries, failures, storage, and export. Ledger reconciliation records cumulative billed charges; billed amounts above list-price charges increase exposure, and lower bills never release allowance.
 
 The current report path is CPU-only and uses the standard library for quantiles, CSV, and SVG output. It requires neither engine packages nor credentials.

@@ -149,6 +149,44 @@ class DecoderTests(unittest.TestCase):
         self.assertEqual(decoder.feed(b"data: ok\n\n" * 10), ["ok"] * 10)
 
 
+class RequestContractTests(unittest.TestCase):
+    def test_only_probe_requests_honor_eos_with_pinned_stop_ids(self):
+        from inference_bench.client import request_body
+        measured = request_body(prompt(), 3, 0)
+        self.assertTrue(measured["ignore_eos"])
+        self.assertNotIn("stop_token_ids", measured)
+        probe = request_body(prompt(), 3, 0, ignore_eos=False, stop_token_ids=[1, 106])
+        self.assertEqual((probe["ignore_eos"], probe["stop_token_ids"]), (False, [1, 106]))
+        self.assertEqual({k: v for k, v in probe.items() if k not in ("ignore_eos", "stop_token_ids")},
+                         {k: v for k, v in measured.items() if k != "ignore_eos"})
+        for kwargs in ({"stop_token_ids": [1]}, {"ignore_eos": False, "stop_token_ids": []},
+                       {"ignore_eos": False, "stop_token_ids": [-1]}, {"ignore_eos": 0}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                request_body(prompt(), 3, 0, **kwargs)
+        with self.assertRaisesRegex(ValueError, "Only conformance"):
+            asyncio.run(run_cell(
+                "http://127.0.0.1:1", [prompt()], concurrency=1, output_tokens=3, seed=0,
+                ignore_eos=False, stop_token_ids=[1],
+            ))
+
+    def test_probe_validation_allows_early_stop_but_not_overrun_or_silence(self):
+        from inference_bench.client import ResponseTrace, _new_record
+        def trace(tokens, text="yes"):
+            result = ResponseTrace(_new_record(prompt(), 0, 8, "conformance", {}))
+            result.accept(json.dumps({
+                "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": tokens},
+            }), 10)
+            result.accept("[DONE]", 20)
+            return result
+        trace(2).validate(exact_output=False)
+        with self.assertRaises(StreamError):
+            trace(2).validate()
+        for tokens, text in ((9, "yes"), (0, "yes"), (2, "")):
+            with self.subTest(tokens=tokens, text=text), self.assertRaises(StreamError):
+                trace(tokens, text).validate(exact_output=False)
+
+
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
     async def test_connection_is_reused_after_done_and_http_completion(self):
         async with server("keepalive") as (origin, state):

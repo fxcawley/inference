@@ -2,7 +2,7 @@
 
 A planned public comparison of **vLLM and SGLang serving Gemma 4 26B-A4B on Modal**, with a short write-up for [cawley.dev](https://cawley.dev).
 
-**Status: the local harness, pilot planning, cost forecasting, recovery planning, and offline reports are implemented.** CPU tests cover streaming/token accounting, deterministic prompts, process cleanup, persistent budgets, and artifact validation. Engine images, model access, and real GPU behavior remain unqualified; there are no measured engine results yet.
+**Status: the local harness, conformance probes, verifiable qualification reports, pilot planning, cost forecasting, billing reconciliation, recovery planning, and offline reports are implemented.** CPU tests cover streaming/token accounting, deterministic prompts, probe behavior, process cleanup, persistent budgets, and artifact validation. Engine images, model access, and real GPU behavior remain unqualified; there are no measured engine results yet. The [secondary assessment](docs/runbook.md#secondary-assessment) records the main remaining risks.
 
 Read the **[full megaplan](docs/megaplan.md)** for the experiment design, implementation work packages, file map, measurement definitions, budget controls, and acceptance criteria.
 
@@ -54,6 +54,9 @@ The core includes:
 - Pure latency/throughput calculations and aggregation across independent repetitions.
 - Durable checksums, completion markers, reproducible bundles, and offline SVG reports.
 - Persistent budget reservations, serial-work checks, absolute leases, bounded logs, process-group cleanup, and GPU identity checks.
+- Five untimed conformance probes per block, plus qualification reports that the formal gate verifies rather than trusts.
+- One project ledger shared by pilot and formal campaigns, with conservative billing reconciliation.
+- Per-repetition SGLang ÷ vLLM ratios in the offline report.
 - Optional source-preparation functions and a Modal **CPU image inspection** entrypoint.
 
 ## Continue without network access
@@ -63,19 +66,21 @@ Use the existing Python environment; these commands need no package downloads:
 ```bash
 PYTHONPATH=src python -m inference_bench plan --phase pilot
 PYTHONPATH=src:tests python -m unittest \
-  test_protocol test_metrics test_runner test_client.DecoderTests -v
+  test_protocol test_metrics test_runner test_client.DecoderTests test_client.RequestContractTests -v
 ```
 
 This test selection uses local files, in-memory client doubles, and short-lived owned processes. The full suite above also includes six loopback HTTP tests.
 
-The new planning commands operate on local artifacts and an existing ledger:
+The planning, qualification, and ledger commands operate on local artifacts and an existing ledger:
 
 ```bash
 python -m inference_bench forecast --input artifacts/pilot --ledger artifacts/budget-ledger.json
+python -m inference_bench qualify --input artifacts/pilot --engine vllm --output configs/qualification/vllm.json
 python -m inference_bench resume-plan --input artifacts/campaign --ledger artifacts/budget-ledger.json
+python -m inference_bench ledger --ledger artifacts/budget-ledger.json
 ```
 
-`forecast` compares the agreed protocol sizes against the remaining budget. `resume-plan` accepts an interrupted campaign, preserves valid cells, and proposes only missing work or the one permitted replacement. Both print advisory JSON; they do not reserve money or launch work. See the [runbook](docs/runbook.md#pilot-planning-and-cost-forecasting) for a synthetic example and the required evidence.
+`forecast` compares the agreed protocol sizes against the remaining budget. `qualify` evaluates one engine's sealed pilot block and writes a report bound to the model, image, engine settings, and harness. `resume-plan` accepts an interrupted campaign, preserves valid cells, and proposes only missing work or the one permitted replacement. These commands do not reserve money or launch work. See the [runbook](docs/runbook.md) for synthetic examples, required evidence, and billing reconciliation.
 
 ## Agreed first study
 
@@ -100,13 +105,13 @@ Prices checked on October 30, 2026 imply approximately **$5.94/hour** for the pr
 1. Run CPU inspection of the pinned images and establish the shared, isolated Python/client environment with complete dependency locks.
 2. Resolve and download the official model and public dataset inside Modal; inspect the actual tokenizer/template, corpus format, and licenses.
 3. Finish the Modal Volume and GPU orchestration adapter using the tested local runner, ledger, and recovery planner. Preserve reservation/call state across failures and machine changes.
-4. Perform real-model conformance checks and the bounded pilot, then freeze the formal protocol and cost forecast.
+4. Run the bounded pilot with its conformance probes, qualify both engines from the exported pilot, then freeze the formal protocol and cost forecast.
 
 `python -m inference_bench validate --require-ready` currently fails with the unresolved prerequisites. `modal_app.py` exposes CPU inspection only; remote GPU dispatch is not wired yet. Direct dependency candidates are recorded in [requirements/](requirements/README.md), and the source/client locks intentionally remain unresolved.
 
 Suggested continuation instruction:
 
-> Read AGENTS.md, docs/runbook.md, and docs/megaplan.md. Continue at the external qualification boundary: inspect the pinned engine images on CPUs, resolve source and client locks, then complete the Modal Volume/GPU adapter around the existing runner and budget ledger. Preserve the agreed protocol and $75 gross budget. Qualify the real request semantics before formal measurements.
+> Read AGENTS.md, docs/runbook.md (including the secondary assessment), and docs/megaplan.md. Continue at the external qualification boundary: inspect the pinned engine images on CPUs, resolve source and client locks, then complete the Modal Volume/GPU adapter around the existing runner, qualification report, and project ledger. Preserve the agreed protocol and $75 gross budget. Qualify the real request semantics before formal measurements.
 
 The site repository is [fxcawley/site](https://github.com/fxcawley/site). Keep the article draft in this repository until measured results are ready: the existing site content loader has no draft filter.
 

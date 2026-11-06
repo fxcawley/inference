@@ -64,7 +64,10 @@ def is_hash(value: Any, length: int = 64) -> bool:
     return isinstance(value, str) and re.fullmatch(rf"[a-f0-9]{{{length}}}", value) is not None
 
 
-def qualification_errors(sources: dict, engines: dict) -> list[str]:
+def qualification_errors(
+    sources: dict, engines: dict, base: Path | None = None, *,
+    configuration: dict | None = None, harness: dict | None = None,
+) -> list[str]:
     """Pending metadata cannot accidentally pass a formal-run gate."""
     errors = []
     if sources.get("schema_version") != 1 or sources.get("status") != "complete":
@@ -104,11 +107,22 @@ def qualification_errors(sources: dict, engines: dict) -> list[str]:
             qualification.get("report_sha256")
         ):
             errors.append(f"{name} real-model qualification is pending")
+        elif base is None:
+            errors.append(f"{name} qualification report was not verified")
+        else:
+            from .qualification import report_errors
+            errors.extend(report_errors(
+                name, engine, sources, Path(base), configuration=configuration, harness=harness,
+            ))
     return errors
 
 
-def measurement_errors(configuration: dict, sources: dict, engines: dict, harness: dict) -> list[str]:
-    errors = qualification_errors(sources, engines)
+def measurement_errors(
+    configuration: dict, sources: dict, engines: dict, harness: dict, base: Path | None = None,
+) -> list[str]:
+    errors = qualification_errors(
+        sources, engines, base, configuration=configuration, harness=harness,
+    )
     experiment, workload = configuration["experiment"], configuration["workload"]
     if sources.get("model", {}).get("repo_id") != experiment["model"]:
         errors.append("model lock differs from configuration")

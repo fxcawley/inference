@@ -29,3 +29,9 @@ jobs:
           python -m inference_bench verify-artifacts --input artifacts/example
           python -m inference_bench analyze --input artifacts/example --output artifacts/example-report --allow-synthetic
           python -m inference_bench bundle --input artifacts/example --output artifacts/example.tar.gz --allow-synthetic
+      - name: Exercise synthetic pilot forecasting, qualification, and ledger reports
+        run: |
+          python -m inference_bench example --phase pilot --output artifacts/example-pilot
+          python -m inference_bench forecast --input artifacts/example-pilot --ledger artifacts/example-pilot/budget-ledger.json --allow-synthetic
+          python -m inference_bench qualify --input artifacts/example-pilot --engine vllm --output artifacts/qualification-vllm.json --allow-synthetic --accept "cpu_preflight=Synthetic CI fixture"
+          python -m inference_bench ledger --ledger artifacts/example-pilot/budget-ledger.json

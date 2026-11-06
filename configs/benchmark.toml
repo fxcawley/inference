@@ -35,6 +35,7 @@ kv_cache_dtype = "auto"
 memory_fraction = 0.85
 
 [budget]
+ledger_id = "gemma4-vllm-sglang-2026"
 total_usd = 75.0
 gpu_container_usd = 60.0
 other_usd = 5.0
