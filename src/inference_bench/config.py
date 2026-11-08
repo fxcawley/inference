@@ -46,6 +46,9 @@ def _number(value: Any, name: str, *, integer: bool = False, minimum: float = 0)
         raise ValueError(f"{name} must be a finite {'integer' if integer else 'number'} >= {minimum}")
 
 
+CELL_FIELDS = ("engine", "profile", "concurrency", "repetition")
+
+
 @dataclass(frozen=True)
 class Cell:
     engine: str

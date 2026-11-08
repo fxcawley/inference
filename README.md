@@ -2,7 +2,7 @@
 
 A planned public comparison of **vLLM and SGLang serving Gemma 4 26B-A4B on Modal**, with a short write-up for [cawley.dev](https://cawley.dev).
 
-**Status: the local harness, conformance probes, verifiable qualification reports, pilot planning, cost forecasting, billing reconciliation, recovery planning, and offline reports are implemented.** CPU tests cover streaming/token accounting, deterministic prompts, probe behavior, process cleanup, persistent budgets, and artifact validation. Engine images, model access, and real GPU behavior remain unqualified; there are no measured engine results yet. The [secondary assessment](docs/runbook.md#secondary-assessment) records the main remaining risks.
+**Status: the local harness, conformance probes, verifiable qualification reports, pilot planning, cost forecasting, billing reconciliation, recovery planning, a backend-neutral campaign controller, and offline reports are implemented.** CPU tests cover streaming/token accounting, deterministic prompts, probe behavior, process cleanup, persistent budgets, and artifact validation. Engine images, model access, and real GPU behavior remain unqualified; there are no measured engine results yet. The [secondary assessment](docs/runbook.md#secondary-assessment) records the main remaining risks.
 
 Read the **[full megaplan](docs/megaplan.md)** for the experiment design, implementation work packages, file map, measurement definitions, budget controls, and acceptance criteria.
 
@@ -56,6 +56,7 @@ The core includes:
 - Persistent budget reservations, serial-work checks, absolute leases, bounded logs, process-group cleanup, and GPU identity checks.
 - Five untimed conformance probes per block, plus qualification reports that the formal gate verifies rather than trusts.
 - One project ledger shared by pilot and formal campaigns, with conservative billing reconciliation.
+- A serial campaign controller: durable call IDs, reservations with explicit queue time, workers that refuse a shortened lease, and settlement only after confirmed termination. The Modal backend for it remains to be written.
 - Per-repetition SGLang ÷ vLLM ratios in the offline report.
 - Optional source-preparation functions and a Modal **CPU image inspection** entrypoint.
 
@@ -104,7 +105,7 @@ Prices checked on October 30, 2026 imply approximately **$5.94/hour** for the pr
 
 1. Run CPU inspection of the pinned images and establish the shared, isolated Python/client environment with complete dependency locks.
 2. Resolve and download the official model and public dataset inside Modal; inspect the actual tokenizer/template, corpus format, and licenses.
-3. Finish the Modal Volume and GPU orchestration adapter using the tested local runner, ledger, and recovery planner. Preserve reservation/call state across failures and machine changes.
+3. Write the Modal backend and GPU functions for the tested controller and `run_worker`, plus the Volume export. Preserve reservation/call state across failures and machine changes.
 4. Run the bounded pilot with its conformance probes, qualify both engines from the exported pilot, then freeze the formal protocol and cost forecast.
 
 `python -m inference_bench validate --require-ready` currently fails with the unresolved prerequisites. `modal_app.py` exposes CPU inspection only; remote GPU dispatch is not wired yet. Direct dependency candidates are recorded in [requirements/](requirements/README.md), and the source/client locks intentionally remain unresolved.

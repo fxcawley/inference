@@ -8,7 +8,7 @@ import shlex
 import sys
 from pathlib import Path
 
-from .config import load_config
+from .config import Config, load_config
 from .provenance import git_identity, measurement_errors, qualification_errors, read_json
 
 
@@ -57,10 +57,22 @@ def main(argv=None) -> int:
     qualify_parser.add_argument("--preflight", type=Path)
     qualify_parser.add_argument("--accept", action="append", default=[], metavar="CHECK=REASON")
     qualify_parser.add_argument("--allow-synthetic", action="store_true")
-    for name in ("ledger", "record-billing"):
+    blocks_parser = commands.add_parser("blocks")
+    blocks_parser.add_argument("--config", type=Path, default=Path("configs/benchmark.toml"))
+    blocks_parser.add_argument("--phase", choices=("measurement", "pilot"), default="measurement")
+    blocks_parser.add_argument("--lease-seconds", type=int, required=True)
+    blocks_parser.add_argument("--queue-seconds", type=int, default=600)
+    blocks_parser.add_argument("--resume-input", type=Path)
+    blocks_parser.add_argument("--ledger", type=Path)
+    blocks_parser.add_argument("--allow-synthetic", action="store_true")
+    for name in ("ledger", "record-billing", "settle"):
         ledger_parser = commands.add_parser(name)
         ledger_parser.add_argument("--config", type=Path, default=Path("configs/benchmark.toml"))
         ledger_parser.add_argument("--ledger", type=Path, required=True)
+        if name == "settle":
+            ledger_parser.add_argument("--reservation", required=True)
+            ledger_parser.add_argument("--charged-seconds", type=int, required=True)
+            ledger_parser.add_argument("--confirmed-stopped", action="store_true")
         if name == "record-billing":
             ledger_parser.add_argument("--through", required=True, help="UTC time, e.g. 2026-11-05T18:00:00Z")
             ledger_parser.add_argument("--gpu-usd", required=True)
@@ -120,11 +132,54 @@ def main(argv=None) -> int:
                 print("Qualification did not pass; the engine lock must remain pending.", file=sys.stderr)
                 return 3
             return 0
+        if args.command == "blocks":
+            from .controller import plan_blocks
+            eligible = None
+            if args.resume_input is not None:
+                from .planning import resume_plan
+                if args.ledger is None:
+                    raise ValueError("Replanning requires the existing project ledger")
+                eligible = resume_plan(
+                    args.resume_input, args.ledger, allow_synthetic=args.allow_synthetic,
+                )["eligible_cells"]
+                config = Config(read_json(args.resume_input / "protocol.json"))
+            else:
+                config = load_config(args.config)
+            if args.lease_seconds <= 60 or args.queue_seconds < 0:
+                raise ValueError("Lease and queue allowances must be whole positive seconds")
+            blocks = plan_blocks(config, phase=args.phase, eligible=eligible)
+            reservation = args.lease_seconds + args.queue_seconds
+            if reservation > config.experiment["block_timeout_s"]:
+                raise ValueError("A block reservation would exceed the maximum block duration")
+            if args.ledger is not None:
+                from .budget import Ledger
+                if not args.ledger.is_file():
+                    raise ValueError("An existing project ledger is required; a missing ledger is not zero usage")
+                allowance = Ledger(args.ledger, config).summary()["remaining"]
+            else:
+                budget = config.data["budget"]
+                allowance = {f"{s}_seconds": budget[f"{s}_seconds"] for s in ("pilot", "formal", "rerun")}
+            stages = {}
+            for block in blocks:
+                stage = stages.setdefault(block["stage"], {"blocks": 0, "worst_case_seconds": 0})
+                stage["blocks"] += 1
+                stage["worst_case_seconds"] += reservation
+                stage["allowance_seconds"] = allowance[f'{block["stage"]}_seconds']
+            print(json.dumps({
+                "advisory_only": True, "reservation_seconds": reservation,
+                "stages": stages, "blocks": blocks,
+            }, indent=2))
+            return 0
         config = load_config(args.config)
-        if args.command in ("ledger", "record-billing"):
+        if args.command in ("ledger", "record-billing", "settle"):
             from .budget import Ledger
             ledger = Ledger(args.ledger, config)
-            if args.command == "record-billing":
+            if args.command == "settle":
+                if not args.ledger.is_file():
+                    raise ValueError("An existing project ledger is required")
+                # Settlement is explicit; a lease deadline or lost response is not enough.
+                ledger.settle(args.reservation, args.charged_seconds, confirmed_stopped=args.confirmed_stopped)
+            elif args.command == "record-billing":
                 from datetime import datetime
                 from .provenance import digest_file
                 through = datetime.fromisoformat(args.through)

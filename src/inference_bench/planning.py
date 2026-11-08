@@ -29,8 +29,8 @@ def _ledger_summary(path: Path, manifest: dict, config: Config) -> tuple[dict, l
         blockers.append("Ledger is locked; resolve the previous controller")
     if summary["unresolved"]:
         blockers.append("Outstanding reservations require confirmation that remote work stopped")
-    if summary["overruns"]:
-        blockers.append("Reservation overruns require billing reconciliation")
+    if summary["unreconciled_overruns"]:
+        blockers.append("Reservation overruns require billing reconciliation through their end")
     if manifest["harness_sha256"] != source_tree_hash():
         blockers.append("Current harness source differs from the frozen campaign")
     return summary, blockers

@@ -1,6 +1,6 @@
 # Current implementation runbook
 
-The local benchmark core, conformance probes, qualification reports, pilot forecast, budget reconciliation, and recovery planner are implemented and tested on Python 3.12 in Linux/WSL. The real engine images, model/tokenizer, dataset source, and Modal integration have not been exercised. There are no measured vLLM/SGLang results and no passed engine qualification.
+The local benchmark core, conformance probes, qualification reports, pilot forecast, budget reconciliation, recovery planner, and backend-neutral campaign controller are implemented and tested on Python 3.12 in Linux/WSL. The real engine images, model/tokenizer, dataset source, and Modal integration have not been exercised. There are no measured vLLM/SGLang results and no passed engine qualification.
 
 ## Local setup and verification
 
@@ -45,6 +45,8 @@ The offline development passes also installed a Python audit hook that rejected 
 | `resume-plan --input CAMPAIGN --ledger FILE` | Inspect complete or interrupted formal artifacts and the existing ledger; print remaining work and blockers without writing either input. |
 | `ledger --ledger FILE` | Print reservations, billing reconciliation, remaining allowances, and warnings. Requires an existing ledger. |
 | `record-billing --ledger FILE --through TIME --gpu-usd X --other-usd Y --source EXPORT` | Append cumulative gross charges from a saved billing export. |
+| `blocks --phase NAME --lease-seconds N [--queue-seconds M] [--resume-input DIR --ledger FILE]` | Preview the serial fresh-process blocks, each reservation, and worst-case stage use. Dispatches nothing. |
+| `settle --ledger FILE --reservation ID --charged-seconds N --confirmed-stopped` | Settle one reservation after its termination was confirmed outside the controller. Without the flag it refuses. |
 | `verify-artifacts --input DIR` | Require the completion marker, exact file set, sizes, and SHA-256 hashes. Reject symlinks and escaping paths. |
 | `analyze --input DIR --output REPORT` | Recompute metrics from raw records and generate CSVs, paired ratios, three SVGs, tables, and claims. Output must be outside the sealed input. |
 | `bundle --input DIR --output FILE.tar.gz` | Create a deterministic archive and SHA-256 receipt. Refuse to replace an existing archive. |
@@ -182,6 +184,49 @@ Reconciliation can only make the ledger more conservative:
 
 `ledger --ledger FILE` reports these values, the remaining dollar and time allowances, and warnings.
 
+An overrun (charged seconds above the reservation) blocks further reservations until billing is recorded through the end of the overrun's charged interval. The billing time cannot fall inside that interval, so the recorded bill includes the overrun's actual usage.
+
+## Campaign controller
+
+`controller.py` turns a frozen schedule into fresh-process blocks and runs them one at a time. It contains no Modal code; the remote adapter supplies a small backend.
+
+`plan_blocks` creates one block per repetition, engine, and attempt in frozen schedule order: two pilot blocks, or six formal blocks with the alternating engine order. With `resume-plan` output, it groups the eligible cells. Unstarted cells form attempt 1 in the formal stage; replacements form attempt 2 in the rerun stage, each linked to its original artifact.
+
+For every block, `execute`:
+
+1. Refuses to start while any reservation is unresolved or an overrun is unreconciled.
+2. Reserves `lease + queue` seconds in the block's stage. A budget refusal stops before submission.
+3. Submits one payload and records the returned call ID in the ledger.
+4. Waits until the lease deadline plus 60 seconds, then cancels a call that is still running.
+5. Settles only after the backend reports that the call ended. Otherwise the reservation remains unresolved and the controller stops.
+6. Stops after any cancelled, overrun, failed, or incomplete block. Inspect it and replan with `resume-plan`.
+
+The charge runs from the earliest plausible container start to the observed end, rounded up. When the worker reports its start time, queue time before that start minus 180 seconds is excluded; otherwise the whole time since reservation counts. A platform restart can make this low, so record billing after each stage.
+
+The worker receives its absolute deadline and a minimum working time equal to the lease. If GPU queueing leaves less than that, it fails before inspecting hardware or creating artifacts. It never starts a block whose results the lease could not cover.
+
+`resolve_outstanding` handles calls left by an earlier controller process. It leaves calls running within their lease alone. It cancels calls past their deadline, then settles only after termination is confirmed. When the end time is unknown, it charges through the lease deadline. Reservations without a call ID need manual confirmation and the `settle` command.
+
+Preview a plan without dispatching:
+
+```bash
+python -m inference_bench blocks --phase pilot --lease-seconds 2400 --queue-seconds 600
+python -m inference_bench blocks --phase measurement --lease-seconds <forecast block_seconds> \
+  --resume-input artifacts/campaign --ledger artifacts/budget-ledger.json
+```
+
+Use the forecast's `block_seconds` as the formal lease. The pilot has no forecast; choose a lease from the startup and cell estimates, and keep two pilot reservations within the 6,000-second pilot allowance.
+
+### Remaining Modal adapter
+
+The adapter must provide `spawn`, `poll`, and `cancel` as described in `controller.Backend`:
+
+- `spawn` submits one GPU invocation without waiting and returns its durable call ID. Do not enable retries.
+- `poll(call_id, timeout_s)` waits up to the timeout. It returns None while the call can still run and a terminal record afterwards. It must work from a new process with only the call ID, so `resolve_outstanding` can recover a disconnected session.
+- `cancel` terminates every container serving the call.
+
+Each GPU function should mount the verified model snapshot and prepared inputs read-only, mount the results Volume, call `runner.run_worker(payload, results_root=..., model_path=..., prompts=...)`, commit the results Volume, and return the worker result. Use one function per engine with the pinned image and `planned_gpu_options()`. Keep the campaign manifest, locks, and ledger with the controller; after a stage, export the committed block directories into the local campaign root, seal it, and analyze it. None of this Modal glue exists yet, and the SDK calls have not been checked against Modal 1.6.3.
+
 ## Implemented boundaries
 
 `workloads.py` accepts a tokenizer object, preserves its role/template prefix and assistant suffix, and fills only the excerpt span to achieve the total input-token budget. It records deterministic source offsets, separates warmup/pilot/measured IDs, and renders the conformance probes with the same template. The real Gemma tokenizer and non-thinking template still need inspection.
@@ -194,7 +239,9 @@ Reconciliation can only make the ledger more conservative:
 
 `qualification.py` holds the canonical probes, the report builder, and the gate's report verification. Probe expectations live in source, so changing them changes the frozen harness identity.
 
-`budget.py` provides a persistent single-controller ledger. An unresolved call retains its full reservation and blocks another GPU submission. Settlement requires explicit confirmation that work stopped; an overrun is charged and blocks further work. The lock file is local process coordination, not a distributed Volume lock.
+`budget.py` provides a persistent single-controller ledger. An unresolved call retains its full reservation and blocks another GPU submission. Settlement requires explicit confirmation that work stopped; an overrun is charged and blocks further work until billing covers it. The lock file is local process coordination, not a distributed Volume lock.
+
+`controller.py` plans and serially executes blocks through an injected backend, and resolves calls left by an earlier controller. `runner.run_worker` validates a block payload, enforces the minimum working time, links replacement cells, runs the block, and returns its start and finish times.
 
 Ledger reads validate reservation and billing identities, amounts, durations, statuses, deadlines, and cumulative order. Malformed or duplicate records cannot silently lower exposure. Planning requires an existing ledger file; a missing file never means zero historical usage.
 
@@ -218,7 +265,7 @@ The core design remains sound: one shared client, colocated loopback measurement
 | Fixed input/output lengths and simultaneous worker starts make C≥4 cells run as synchronized waves. High-concurrency TTFT then largely measures how each engine prefills a full wave, including its default chunked-prefill budget. | Disclose in the methods and article. No protocol change. |
 | At C=32, the prefill shape needs 135,168 concurrent tokens. Engine KV accounting, sliding-window support, and memory reservations may make capacity bind differently. | Qualification records parsed capacity and requires review if unobserved or insufficient. Report it beside the results. |
 | Fresh single-use containers start with empty compiler/JIT caches. With eight CPU cores, cold starts could approach the 900-second readiness limit and consume much of the pilot allowance. | Adapter decision: consider a per-engine writable compile-cache Volume and a longer first-pilot readiness limit, and record cache state. Observed startup enters the forecast. |
-| A reservation's lease starts when it is recorded, so GPU queueing consumes the lease. | Adapter decision: reserve immediately before dispatch and include an explicit queue allowance, or fail fast and settle. |
+| A reservation's lease starts when it is recorded, so GPU queueing consumes the lease. | Addressed in the controller: reservations add an explicit queue allowance, workers refuse to start without their full working lease, and reported worker start times exclude queueing from the charge. |
 | The harness identity covers every package module, including analysis and planning. A post-freeze code change blocks resumption and invalidates qualification. | Finish analysis/planning changes before the formal freeze. |
 | The WikiText dataset is reported as CC BY-SA licensed. Prepared prompt text in a public bundle would carry attribution and share-alike terms. | Verify the pinned dataset card during preparation. Keep project code under MIT and data under its own terms. |
 
@@ -237,11 +284,11 @@ The core design remains sound: one shared client, colocated loopback measurement
 
 3. Inspect each engine interpreter and CLI. Build the same isolated Python 3.12 client environment in both images, resolve full transitive dependency locks with hashes, and record the derived Modal image IDs. Keep native engine dependencies intact.
 4. Set up the upstream access Secret in Modal. Resolve model/dataset commits, inspect licensing/configuration, download and hash the snapshot in CPU preparation, and verify the real tokenizer, template, stop IDs, prepared prompts, and conformance probes.
-5. Finish the Modal adapter: version-2 Volumes, read-only model/input mounts, the shared client interpreter, serial GPU calls, durable call IDs, absolute leases, per-cell commits, complete attempt history, and exports. Include `reservation_id` in each block's context so it reaches its block, cell, and request records. Preserve `replacement_for` links for replacement cells. Decide the compile-cache and lease-queueing policies from the assessment. The resource contract is in `planned_gpu_options()`; no GPU functions are currently registered.
+5. Finish the Modal adapter around the tested controller: the backend's `spawn`/`poll`/`cancel`, one GPU function per engine calling `run_worker`, version-2 Volumes, read-only model/input mounts, the shared client interpreter, results commits, and exports. The controller already passes reservation IDs, deadlines, and replacement links through to the block, cell, and request records. Decide the compile-cache policy from the assessment. The resource contract is in `planned_gpu_options()`; no GPU functions are currently registered.
 6. Count every allocation in the ledger, including retries, preemptions, startup, idle time, and failed attempts. Do not settle from one successful attempt's measurement duration. Record billing after each stage.
 7. Run the bounded conformance pilot. Export it, qualify both engines, confirm the log/endpoint patterns, update the engine lock with passed reports, and use the local forecast to select the full or compact protocol before formal measurements.
 
-The existing `run_block` and ledger are integration components, not a one-command paid campaign launcher. The megaplan's `pilot`, `benchmark`, and `export` Modal entrypoints remain to be connected after these checks.
+The controller, worker entry, and ledger are integration components, not yet a one-command paid campaign launcher. The megaplan's `pilot`, `benchmark`, and `export` Modal entrypoints remain to be connected to them after these checks.
 
 ## Recovery and laptop handoff
 
