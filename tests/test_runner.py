@@ -395,28 +395,43 @@ class ProcessTests(unittest.TestCase):
             "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]);"
             "time.sleep(60)"
         )
+        def identity(pid):
+            # State and start time follow the parenthesized command name in /proc/PID/stat.
+            text = Path(f"/proc/{pid}/stat").read_text()
+            fields = text[text.rindex(")") + 2:].split()
+            return fields[0], fields[19]
+
         with self.assertRaisesRegex(RuntimeError, "simulated failure"):
             with ProcessGroup(
                 [sys.executable, "-c", parent, child, str(pidfile)],
                 self.root / "server.log", Deadline(time.time() + 10), grace_s=0.05,
             ):
-                until = time.monotonic() + 3
-                while not pidfile.exists() and time.monotonic() < until:
+                until = time.monotonic() + 5
+                text = ""
+                while not text.isdigit() and time.monotonic() < until:
+                    text = pidfile.read_text().strip() if pidfile.exists() else ""
                     time.sleep(0.01)
-                self.assertTrue(pidfile.exists())
-                pid = int(pidfile.read_text())
+                self.assertTrue(text.isdigit(), "grandchild did not record its PID")
+                pid = int(text)
+                _, started = identity(pid)
                 raise RuntimeError("simulated failure")
-        status = Path(f"/proc/{pid}/status")
+
         def alive():
+            # A reused PID is a different process; zombies and dead tasks no longer run.
             try:
-                return "State:\tZ" not in status.read_text()
+                state, start = identity(pid)
             except (FileNotFoundError, ProcessLookupError):
                 return False
+            return start == started and state not in ("Z", "X", "x")
 
-        until = time.monotonic() + 3
+        until = time.monotonic() + 10
         while alive() and time.monotonic() < until:
             time.sleep(0.01)
-        self.assertFalse(alive())
+        try:
+            details = Path(f"/proc/{pid}/status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            details = "process exited"
+        self.assertFalse(alive(), details)
 
     def test_backward_wall_clock_does_not_extend_lease(self):
         now = time.time()
