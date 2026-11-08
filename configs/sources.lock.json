@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "status": "unresolved",
+  "model": {
+    "repo_id": "google/gemma-4-26B-A4B-it",
+    "revision": null,
+    "files": {}
+  },
+  "dataset": {
+    "repo_id": "Salesforce/wikitext",
+    "configuration": "wikitext-2-raw-v1",
+    "split": "train",
+    "revision": null,
+    "license": null,
+    "files": {}
+  },
+  "prompts": {
+    "manifest_sha256": null,
+    "generator_version": null
+  }
+}

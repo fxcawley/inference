@@ -4,7 +4,13 @@ Build a reproducible public comparison of vLLM and SGLang serving Gemma 4 26B-A4
 
 ## 1. Status and decisions
 
-**Planning date:** October 30, 2026. **Current deliverable:** the megaplan and repository handoff documentation. The repository has been initialized; benchmark code, environments, cloud resources, model downloads, paid runs, and an article have not been created.
+**Planning date:** October 30, 2026. This file records the full project plan. The local harness, CPU tests, and offline report path have since been implemented; see [the current runbook](runbook.md) for working commands and remaining integration work. No real-model or GPU qualification has been performed.
+
+Implementation choices for the offline stage: HTTPX 0.28.1 supplies the common streaming transport, standard-library `unittest` supplies CPU tests, and the analysis emits SVG directly. These replace the proposed aiohttp/pytest/Matplotlib dependencies while preserving the experimental contract. The hash-locked remote environments and Modal GPU orchestration remain external qualification work.
+
+The November 2 offline continuation implemented the bounded pilot schedule and separate inputs, artifact-based cost forecasts for the four agreed protocol sizes, and read-only recovery planning with persistent budget/attempt checks. `planning.py` provides these local plans; it does not dispatch remote calls. See the runbook for commands, evidence requirements, and the forecast's overhead assumptions.
+
+A later offline secondary assessment kept the agreed compact-protocol order. It added executable conformance probes, qualification reports that the formal gate verifies, a project ledger shared by pilot and formal campaigns, conservative billing reconciliation, and paired engine ratios. The runbook's [secondary assessment](runbook.md#secondary-assessment) records the findings and the adapter decisions that remain open.
 
 The project decisions are:
 
@@ -323,7 +329,7 @@ The smallest publishable planned study is therefore two profiles × three concur
 
 ### 5.1 One measurement implementation
 
-Implement a small engine-independent client around `aiohttp` and a streaming SSE parser. Use the same client source, Python version, package lock, connection settings, request bodies, and timing code in both images.
+The implemented engine-independent client uses HTTPX 0.28.1 and a streaming SSE parser. Use the same client source, Python version, package lock, connection settings, request bodies, and timing code in both images.
 
 Do not take vLLM's benchmark summary for one engine and SGLang's summary for the other. Their official benchmark tools are useful references, but combining their independently calculated metrics would introduce an avoidable difference.
 
@@ -840,7 +846,7 @@ The latter two are derived compute-price estimates at the measured utilization. 
 
 ## 10. Repository scaffold and responsibilities
 
-The handoff already supplies `README.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.gitattributes`, and this megaplan. Create the remaining structure during implementation. Keep the module boundaries practical; do not introduce a plugin system.
+The local package, tests, configuration, analysis, and handoff documentation are implemented. The tree below remains the blueprint for the complete study, including dependency locks and report files that still depend on external qualification and measured data. The current runbook records that boundary. Keep the module boundaries practical; do not introduce a plugin system.
 
 ```text
 inference/
@@ -897,7 +903,7 @@ inference/
 |---|---|
 | `README.md` | Research question, current result status, quickstart, reproduction paths, and eventual result links. |
 | `AGENTS.md` | The benchmark invariants, artifact rules, explicit distinction between mocked tests and measured results, and the site voice reference. |
-| `pyproject.toml` | Python 3.12 package, `inference-bench` CLI, CPU-oriented optional dependency groups, pytest and Ruff configuration. |
+| `pyproject.toml` | Python 3.12 package, `inference-bench` CLI, CPU-oriented optional dependency groups, and optional Ruff configuration. |
 | `requirements/*.lock.txt` | Exact transitive CPU dependency sets with hashes; GPU engines are pinned by images instead. |
 | `configs/benchmark.toml` | Matrix, controls, request/warmup counts, seed, schedule, resource allocations, budget, and timeout policy. |
 | `sources.lock.json` | Immutable model, dataset, template, and prepared-input identities. |
@@ -919,7 +925,7 @@ inference/
 | `report/article.md` | Working draft outside the site content directory until measured claims and site integration are ready. |
 | CI | CPU-only tests/lint and fixture-based analysis regeneration; no secrets or paid runs. |
 
-Use standard-library `argparse`, `tomllib`, dataclasses, JSON, hashing, and subprocess utilities where sufficient. Suggested external dependencies are Modal for the controller, `aiohttp` for the client, Hub/dataset/tokenizer packages for CPU preparation, and NumPy/Matplotlib for analysis.
+The implementation uses standard-library `argparse`, `tomllib`, dataclasses, JSON, hashing, subprocess utilities, and `unittest`. HTTPX supplies the common HTTP client; Modal and Hub/tokenizer libraries remain separate integration dependencies. Analysis computes the documented linear quantiles and emits CSV/SVG without NumPy or Matplotlib.
 
 Do not make Pandas, a notebook server, Docker, or a GPU engine a local requirement unless an implementation need justifies it. A standalone analysis CLI is enough.
 
@@ -931,7 +937,7 @@ Original project code and documentation use the MIT license. Dataset and model t
 
 **Files:** repository metadata, `README.md`, `AGENTS.md`, `.gitignore`, `.gitattributes`, `pyproject.toml`, dependency lock files, initial `configs/benchmark.toml`.
 
-Git initialization, the public repository, the initial documentation, and ignore/line-ending rules are already part of the handoff. The Python package and controller remain to implement.
+The public repository, Python package, offline controller, and CPU tests are implemented. Complete dependency locks and actual Modal connectivity remain part of external qualification.
 
 Actions:
 
@@ -1130,11 +1136,11 @@ Do not assume a high server token rate proves that client-side TTFT is accuratel
 After implementation:
 
 ```bash
-python -m pytest -q
-python -m ruff check .
+python -m unittest discover -s tests -v
 python -m inference_bench validate --config configs/benchmark.toml
 python -m inference_bench plan --config configs/benchmark.toml
-python -m inference_bench analyze --input tests/fixtures/example_campaign --output /tmp/bench-fixture-report
+python -m inference_bench example --output artifacts/example
+python -m inference_bench analyze --input artifacts/example --output artifacts/example-report --allow-synthetic
 ```
 
 Run relevant tests while developing and the small complete CPU suite before the pilot/final release. Do not start GPU jobs from CI.
@@ -1143,7 +1149,7 @@ The site gate is `npm run build` on the integration worktree. Use `npm ci` there
 
 ## 13. Command-line runbook to implement
 
-The clone commands work for this documentation repository. The environment and benchmark commands describe the intended scaffold interface; that implementation does not exist yet.
+These commands describe the full intended study interface. Use [the current runbook](runbook.md) for the implemented commands. Hash-locked remote environments and paid campaign orchestration remain to be connected after external qualification.
 
 ### 13.1 Controller setup
 

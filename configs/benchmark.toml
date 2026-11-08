@@ -1,0 +1,59 @@
+schema_version = 1
+
+[experiment]
+model = "google/gemma-4-26B-A4B-it"
+seed = 20261030
+concurrency = [1, 4, 16, 32]
+repetitions = 3
+requests_per_cell = 256
+max_model_len = 8192
+max_running_requests = 32
+warmup_min = 8
+warmup_waves = 2
+request_timeout_s = 300
+ready_timeout_s = 900
+block_timeout_s = 7200
+
+[profiles.short]
+input_tokens = 512
+output_tokens = 128
+
+[profiles.prefill]
+input_tokens = 4096
+output_tokens = 128
+
+[profiles.decode]
+input_tokens = 512
+output_tokens = 512
+
+[hardware]
+gpu = "H200"
+cpu_cores = 8
+memory_mib = 131072
+dtype = "bfloat16"
+kv_cache_dtype = "auto"
+memory_fraction = 0.85
+
+[budget]
+ledger_id = "gemma4-vllm-sglang-2026"
+total_usd = 75.0
+gpu_container_usd = 60.0
+other_usd = 5.0
+reserve_usd = 10.0
+max_gpu_seconds = 36000
+pilot_seconds = 6000
+formal_seconds = 24000
+rerun_seconds = 6000
+
+[pricing]
+checked_on = "2026-10-30"
+gpu_per_second = 0.001261
+cpu_per_core_second = 0.0000131
+memory_per_gib_second = 0.00000222
+
+[workload]
+dataset = "Salesforce/wikitext"
+dataset_config = "wikitext-2-raw-v1"
+split = "train"
+instruction = "Summarize and explain the following passage in detail."
+enable_thinking = false
