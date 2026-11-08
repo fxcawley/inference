@@ -157,6 +157,21 @@ class Ledger:
             else record["charged_usd"]
         )
 
+    @staticmethod
+    def _end(record: dict) -> float:
+        """The latest time a lease could have run, including any charged overrun."""
+        if record["status"] == "reserved":
+            return record["deadline_unix"]
+        return max(record["deadline_unix"], record["created_unix"] + record["charged_seconds"])
+
+    def _unreconciled_overruns(self, data: dict) -> list[str]:
+        # Billing through an overrun's full charged interval captures its actual usage.
+        through = data["billing"][-1]["through_unix"] if data["billing"] else None
+        return [
+            r["id"] for r in data["reservations"]
+            if r["status"] == "overrun" and (through is None or through < self._end(r))
+        ]
+
     def _exposure(self, data: dict) -> dict:
         """Billing can only increase exposure; a lower bill never releases allowance."""
         records = data["reservations"]
@@ -165,7 +180,7 @@ class Ledger:
         billed_gpu = Decimal(latest["gpu_container_usd"]) if latest else Decimal(0)
         billed_other = Decimal(latest["other_usd"]) if latest else Decimal(0)
         covered = sum(
-            (self._dollars(r) for r in records if latest and r["deadline_unix"] <= through),
+            (self._dollars(r) for r in records if latest and self._end(r) <= through),
             Decimal(0),
         )
         ledger = sum((self._dollars(r) for r in records), Decimal(0))
@@ -216,8 +231,8 @@ class Ledger:
             records = data["reservations"]
             if any(r["status"] == "reserved" for r in records):
                 raise BudgetError("An unresolved call retains its reservation; GPU work is serial")
-            if any(r["status"] == "overrun" for r in records):
-                raise BudgetError("A previous reservation overran; reconcile before further work")
+            if self._unreconciled_overruns(data):
+                raise BudgetError("A reservation overran; record billing through its end before further work")
             exposure = self._exposure(data)
             if exposure["billed_through_unix"] is not None and now < exposure["billed_through_unix"]:
                 raise BudgetError("A new lease cannot start inside an already reconciled billing period")
@@ -296,9 +311,9 @@ class Ledger:
         with self._exclusive():
             data = self.read()
             for record in data["reservations"]:
-                if record["created_unix"] < through_unix < record["deadline_unix"]:
+                if record["created_unix"] < through_unix < self._end(record):
                     raise BudgetError("Billing period ends inside a lease; choose a time when no call could run")
-                if record["deadline_unix"] <= through_unix and record["status"] == "reserved":
+                if self._end(record) <= through_unix and record["status"] == "reserved":
                     raise BudgetError("Settle every call in the billed period before reconciling")
             if data["billing"]:
                 previous = data["billing"][-1]
@@ -334,6 +349,7 @@ class Ledger:
             "exposure_seconds": sum(self._seconds(r) for r in records),
             "unresolved": [r["id"] for r in records if r["status"] == "reserved"],
             "overruns": [r["id"] for r in records if r["status"] == "overrun"],
+            "unreconciled_overruns": self._unreconciled_overruns(data),
             "reservation_ids": [r["id"] for r in records],
             "stages": {
                 stage: {

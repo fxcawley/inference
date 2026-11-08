@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -12,12 +13,21 @@ import time
 from pathlib import Path
 
 from . import engines
-from .artifacts import seal, write_json, write_jsonl
+from .artifacts import safe_path, seal, write_json, write_jsonl
 from .client import http_client, run_cell
-from .config import Cell, Config
+from .config import CELL_FIELDS, Cell, Config
 from .provenance import environment, source_tree_hash
 from .qualification import evaluate_probe, select_probes
 from .workloads import sampling_seed, select_prompts
+
+WORKER_KEYS = {
+    "schema_version", "phase", "engine", "config", "cells", "context", "cell_context",
+    "deadline_unix", "minimum_start_s", "directory",
+}
+
+
+def _finite(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
 
 
 class Deadline:
@@ -200,7 +210,8 @@ async def _conformance(
 async def run_block(
     directory: Path, config: Config, *, engine: str, model_path: str,
     cells: list[Cell], prompts: list[dict], context: dict, deadline_unix: float,
-    phase: str = "measurement", port: int = 8000,
+    phase: str = "measurement", port: int = 8000, minimum_start_s: float = 0,
+    cell_context: dict | None = None,
 ) -> dict:
     """Run one fresh server. Remote wrappers own reservation/Volume commits."""
     if phase not in ("measurement", "pilot"):
@@ -232,6 +243,20 @@ async def run_block(
         )
         for cell in cells
     ]
+    cell_context = cell_context or {}
+    keys = {cell.key for cell in cells}
+    if set(cell_context) - keys or any(
+        not isinstance(value, dict) or set(value) != {"replacement_for"}
+        or not isinstance(value["replacement_for"], str) or not value["replacement_for"]
+        for value in cell_context.values()
+    ):
+        raise ValueError("Cell context may only link replacements to their original artifacts")
+    if (context.get("attempt") == 2) != bool(cell_context) or (cell_context and set(cell_context) != keys):
+        raise ValueError("Every replacement cell, and only a replacement cell, links its original attempt")
+    if not _finite(minimum_start_s) or minimum_start_s < 0:
+        raise ValueError("Minimum start time must be finite and nonnegative")
+    if deadline.remaining() < minimum_start_s:
+        raise TimeoutError("Queueing left less than the block's working lease; nothing was started")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     history = []
@@ -273,7 +298,10 @@ async def run_block(
                     transition("conformance_passed")
                     for cell, warmup, measured in planned:
                         server.check()
-                        metadata = {**context, **cell.to_dict(), "cell_id": cell.key}
+                        metadata = {
+                            **context, **cell.to_dict(), "cell_id": cell.key,
+                            **cell_context.get(cell.key, {}),
+                        }
                         cell_dir = directory / "cells" / f"{cell.profile}-c{cell.concurrency}"
                         cell_dir.mkdir(parents=True, exist_ok=False)
                         write_json(cell_dir / "manifest.json", metadata)
@@ -327,3 +355,36 @@ async def run_block(
         write_json(directory / "timing.json", timing)
         seal(directory)
     return outcome
+
+
+def run_worker(payload: dict, *, results_root: Path, model_path: str, prompts: list[dict]) -> dict:
+    """Entry point for one remote GPU invocation; the adapter commits results afterwards."""
+    started = time.time()
+    if not isinstance(payload, dict) or set(payload) != WORKER_KEYS or payload["schema_version"] != 1:
+        raise ValueError("Unsupported block payload")
+    config = Config(payload["config"])
+    if payload["context"].get("config_sha256") != config.fingerprint:
+        raise ValueError("Block configuration differs from its campaign")
+    cells = [Cell(**{key: cell[key] for key in CELL_FIELDS}) for cell in payload["cells"]]
+    directory, context = payload["directory"], payload["context"]
+    reservation = context.get("reservation_id")
+    if (
+        not cells or context.get("attempt") not in (1, 2)
+        or not isinstance(reservation, str) or not re.fullmatch(r"[0-9a-f]{32}", reservation)
+        or directory != f'runs/{payload["engine"]}/r{cells[0].repetition}/a{context["attempt"]}-{reservation}'
+    ):
+        raise ValueError("Block directory differs from its engine, repetition, attempt, or reservation")
+    try:
+        outcome = asyncio.run(run_block(
+            safe_path(Path(results_root), directory), config, engine=payload["engine"],
+            model_path=model_path, cells=cells, prompts=prompts, context=payload["context"],
+            deadline_unix=payload["deadline_unix"], phase=payload["phase"],
+            minimum_start_s=payload["minimum_start_s"], cell_context=payload["cell_context"],
+        ))
+    except Exception as exc:
+        outcome = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:1000]}
+    # Start and finish times let the controller exclude queue time from its charge.
+    return {
+        **outcome, "schema_version": 1, "directory": directory,
+        "started_unix": started, "finished_unix": time.time(),
+    }

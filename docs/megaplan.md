@@ -12,6 +12,8 @@ The November 2 offline continuation implemented the bounded pilot schedule and s
 
 A later offline secondary assessment kept the agreed compact-protocol order. It added executable conformance probes, qualification reports that the formal gate verifies, a project ledger shared by pilot and formal campaigns, conservative billing reconciliation, and paired engine ratios. The runbook's [secondary assessment](runbook.md#secondary-assessment) records the findings and the adapter decisions that remain open.
 
+The serial dispatch loop is implemented as a backend-neutral controller (`controller.py`) with a worker entry point (`runner.run_worker`). The remaining Modal work is the backend's submit/poll/cancel calls, the GPU functions, Volume mounts and commits, and export; see the runbook's [campaign controller](runbook.md#campaign-controller) section.
+
 The project decisions are:
 
 | Question | Decision |

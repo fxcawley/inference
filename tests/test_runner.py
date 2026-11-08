@@ -1,6 +1,9 @@
 import asyncio
+import contextlib
 import copy
 import importlib.util
+import io
+import json
 import shutil
 import sys
 import tempfile
@@ -477,34 +480,344 @@ def probe_result(prompt, *, broken=None, **kwargs):
     return {"records": [record], "events": [], "summary": None}
 
 
+def fake_engine(test, broken=None):
+    """Patch the GPU, server process, and HTTP client; record the cells sent to it."""
+    @asynccontextmanager
+    async def fake_client(*args):
+        yield object()
+
+    cells = []
+
+    async def fake_run_cell(origin, prompts, **kwargs):
+        if kwargs["phase"] == "conformance":
+            test.assertEqual(kwargs["ignore_eos"], kwargs["stop_token_ids"] is None)
+            return probe_result(prompts[0], broken=broken, **kwargs)
+        cells.append((prompts, kwargs))
+        return {
+            "records": [], "events": [], "summary": {"valid": True},
+            "client_loop_lag_ms": [], "client_lag_interval_ms": 10,
+        }
+
+    patches = (
+        patch("inference_bench.runner.engines.inspect_hardware", return_value=[]),
+        patch("inference_bench.runner.ProcessGroup"),
+        patch("inference_bench.runner.http_client", fake_client),
+        patch("inference_bench.runner.wait_ready", new_callable=AsyncMock,
+              return_value={"data": [{"id": "gemma4-bench"}]}),
+        patch("inference_bench.runner._sample_gpu", new_callable=AsyncMock),
+        patch("inference_bench.runner.run_cell", fake_run_cell),
+    )
+    return patches, cells
+
+
+class FakeClock:
+    def __init__(self, now=1_000_000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0, seconds)
+
+
+class FakeBackend:
+    """Scripted remote calls on a fake clock; asserts that GPU work stays serial."""
+
+    def __init__(self, clock, scripts):
+        self.clock, self.scripts, self.calls, self.cancelled = clock, list(scripts), {}, []
+
+    def spawn(self, payload):
+        assert all(c["end"] is not None and c["end"] <= self.clock() for c in self.calls.values()), "concurrent GPU work"
+        script = self.scripts.pop(0)
+        if script.get("spawn_error"):
+            raise ConnectionError("submission lost")
+        start = self.clock() + script.get("queue", 0)
+        call_id = f"fc-{len(self.calls)}"
+        self.calls[call_id] = {
+            "payload": payload, "script": script, "start": start,
+            "end": None if script.get("hang") else start + script["duration"],
+        }
+        return call_id
+
+    def poll(self, call_id, timeout_s):
+        call = self.calls[call_id]
+        if call["script"].get("poll_error") and not call.get("errored"):
+            call["errored"] = True
+            raise ConnectionError("poll interrupted")
+        if call["end"] is not None and call["end"] <= self.clock() + timeout_s:
+            self.clock.now = max(self.clock.now, call["end"])
+            if call.get("cancelled") or call["script"].get("crash"):
+                return {"state": "failed", "error": "cancelled" if call.get("cancelled") else "worker crashed"}
+            return {"state": "returned", "result": {
+                "status": call["script"].get("status", "complete"),
+                "directory": call["payload"]["directory"],
+                "started_unix": call["start"], "finished_unix": call["end"],
+            }}
+        self.clock.now += timeout_s
+        return None
+
+    def cancel(self, call_id):
+        self.cancelled.append(call_id)
+        call = self.calls[call_id]
+        if not call["script"].get("ignore_cancel"):
+            call.update(end=self.clock(), cancelled=True)
+
+
+class ControllerTests(unittest.TestCase):
+    def setUp(self):
+        from inference_bench.artifacts import create_campaign
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = load_config(ROOT / "configs/benchmark.toml")
+        self.campaign = create_campaign(
+            self.root / "pilot", self.config, read_json(ROOT / "configs/sources.lock.json"),
+            read_json(ROOT / "configs/engines.lock.json"), campaign_id="controller-test",
+            evidence_kind="synthetic", harness={"note": "test fixture"}, phase="pilot",
+        )
+        self.ledger = Ledger(self.root / "ledger.json", self.config)
+        self.clock = FakeClock()
+
+    def execute(self, scripts, *, lease=2000, queue=600):
+        from inference_bench.controller import execute, plan_blocks
+        backend = FakeBackend(self.clock, scripts)
+        result = execute(
+            plan_blocks(self.config, phase="pilot"), campaign=self.campaign, config=self.config,
+            ledger=self.ledger, backend=backend, lease_s=lease, queue_s=queue, poll_s=15,
+            clock=self.clock, sleep=self.clock.sleep,
+        )
+        return result, backend
+
+    def test_blocks_run_serially_with_leases_and_queue_time_excluded(self):
+        result, backend = self.execute([{"queue": 300, "duration": 1000}, {"duration": 800}])
+        self.assertIsNone(result["stopped"])
+        # The first worker started after 300 seconds in the queue; 180 seconds remain charged for startup.
+        self.assertEqual([b["charged_seconds"] for b in result["completed_blocks"]], [1180, 800])
+        records = self.ledger.read()["reservations"]
+        self.assertEqual([r["remote_call_id"] for r in records], ["fc-0", "fc-1"])
+        self.assertEqual({r["status"] for r in records}, {"settled"})
+        for record, call in zip(records, backend.calls.values()):
+            payload = call["payload"]
+            self.assertEqual(record["reserved_seconds"], 2600)
+            self.assertEqual(payload["deadline_unix"], record["deadline_unix"])
+            self.assertEqual(payload["minimum_start_s"], 2000)
+            self.assertEqual(payload["context"]["reservation_id"], record["id"])
+            self.assertTrue(payload["directory"].endswith(record["id"]))
+        self.assertEqual(
+            [call["payload"]["engine"] for call in backend.calls.values()],
+            [cell.engine for cell in self.config.cells(phase="pilot")][::12],
+        )
+
+    def test_hung_call_is_cancelled_charged_as_an_overrun_and_blocks_until_billed(self):
+        result, backend = self.execute([{"hang": True}, {"duration": 10}])
+        self.assertEqual((backend.cancelled, len(backend.calls)), (["fc-0"], 1))
+        block = result["completed_blocks"][0]
+        self.assertTrue(block["cancelled"] and block["overrun"])
+        self.assertEqual(block["charged_seconds"], 2660)
+        self.assertIn("did not complete", result["stopped"]["reason"])
+        summary = self.ledger.summary()
+        self.assertEqual(summary["unreconciled_overruns"], summary["overruns"])
+        again, _ = self.execute([{"duration": 10}])
+        self.assertIn("Resolve", again["stopped"]["reason"])
+        record = self.ledger.read()["reservations"][0]
+        with self.assertRaisesRegex(BudgetError, "inside a lease"):
+            self.ledger.record_billing(record["deadline_unix"], "4.5", "0", "a" * 64, now=self.clock())
+        self.ledger.record_billing(record["created_unix"] + 2660, "4.5", "0", "a" * 64, now=self.clock())
+        self.assertEqual(self.ledger.summary()["unreconciled_overruns"], [])
+        resumed, _ = self.execute([{"duration": 10}, {"duration": 10}])
+        self.assertIsNone(resumed["stopped"])
+
+    def test_unconfirmed_termination_keeps_the_reservation_until_resolved(self):
+        from inference_bench.controller import resolve_outstanding
+        result, backend = self.execute([{"hang": True, "ignore_cancel": True}])
+        self.assertIn("did not confirm termination", result["stopped"]["reason"])
+        summary = self.ledger.summary()
+        self.assertEqual((len(summary["unresolved"]), summary["exposure_seconds"]), (1, 2600))
+        report = resolve_outstanding(self.ledger, backend, clock=self.clock)
+        self.assertEqual(report[0]["action"], "termination unconfirmed; reservation kept")
+        backend.calls["fc-0"]["script"]["ignore_cancel"] = False
+        report = resolve_outstanding(self.ledger, backend, clock=self.clock)
+        self.assertEqual((report[0]["action"], report[0]["overrun"]), ("settled", True))
+        self.assertEqual(self.ledger.summary()["unresolved"], [])
+
+    def test_submission_failure_leaves_an_unattached_reservation_for_review(self):
+        from inference_bench.controller import resolve_outstanding
+        result, backend = self.execute([{"spawn_error": True}])
+        self.assertIn("Submission failed", result["stopped"]["reason"])
+        record = self.ledger.read()["reservations"][0]
+        self.assertEqual((record["status"], record["remote_call_id"]), ("reserved", None))
+        report = resolve_outstanding(self.ledger, backend, clock=self.clock)
+        self.assertTrue(report[0]["action"].startswith("manual"))
+
+    def test_failed_or_crashed_block_is_settled_before_stopping(self):
+        for name, script in (("failed", {"duration": 100, "status": "failed"}),
+                             ("crashed", {"duration": 100, "crash": True})):
+            with self.subTest(name=name):
+                self.ledger = Ledger(self.root / f"ledger-{name}.json", self.config)
+                result, backend = self.execute([script, {"duration": 100}])
+                self.assertEqual(len(backend.calls), 1)
+                self.assertIn("did not complete", result["stopped"]["reason"])
+                self.assertEqual(self.ledger.summary()["unresolved"], [])
+                self.assertEqual(result["completed_blocks"][0]["charged_seconds"], 100)
+
+    def test_budget_limit_stops_before_any_submission(self):
+        result, backend = self.execute([{"duration": 10}], lease=5500, queue=600)
+        self.assertIn("Budget limit", result["stopped"]["reason"])
+        self.assertEqual((backend.calls, self.ledger.read()["reservations"]), ({}, []))
+
+    def test_transient_poll_errors_keep_waiting_for_the_same_call(self):
+        result, backend = self.execute([{"duration": 100, "poll_error": True}, {"duration": 100}])
+        self.assertIsNone(result["stopped"])
+        self.assertEqual(len(result["completed_blocks"][0]["poll_errors"]), 1)
+        self.assertEqual(len(backend.calls), 2)
+
+    def test_resolution_waits_for_live_calls_and_uses_reported_finish_times(self):
+        from inference_bench.controller import resolve_outstanding
+        backend = FakeBackend(self.clock, [{"duration": 500}])
+        lease = self.ledger.reserve("pilot", 1000, now=self.clock())
+        self.ledger.attach_call(lease["id"], backend.spawn({"directory": "runs/vllm/r1/a1-earlier"}))
+        report = resolve_outstanding(self.ledger, backend, clock=self.clock)
+        self.assertEqual(report[0]["action"], "running within its lease; check again later")
+        # The earlier controller disappeared; its call finished long before this check.
+        self.clock.now += 3600
+        entry = resolve_outstanding(self.ledger, backend, clock=self.clock)[0]
+        self.assertEqual((entry["action"], entry["charged_seconds"], entry["overrun"]), ("settled", 500, False))
+
+    def test_plans_follow_the_frozen_schedule_and_group_replacements(self):
+        from inference_bench.controller import plan_blocks
+        pilot = plan_blocks(self.config, phase="pilot")
+        self.assertEqual(
+            [(b["engine"], b["stage"], len(b["cells"])) for b in pilot],
+            [("vllm", "pilot", 12), ("sglang", "pilot", 12)],
+        )
+        self.assertEqual([c for b in pilot for c in b["cells"]], [c.to_dict() for c in self.config.cells(phase="pilot")])
+        formal = plan_blocks(self.config, phase="measurement")
+        self.assertEqual(
+            [(b["repetition"], b["engine"]) for b in formal],
+            [(1, "vllm"), (1, "sglang"), (2, "sglang"), (2, "vllm"), (3, "vllm"), (3, "sglang")],
+        )
+        cells = self.config.cells()
+        eligible = [
+            {**cells[0].to_dict(), "attempt": 2, "replacement_for": "runs/vllm/r1/a1-old/cells/one"},
+            {**cells[30].to_dict(), "attempt": 1, "replacement_for": None},
+            {**cells[1].to_dict(), "attempt": 2, "replacement_for": "runs/vllm/r1/a1-old/cells/two"},
+        ]
+        blocks = plan_blocks(self.config, phase="measurement", eligible=eligible)
+        self.assertEqual(
+            [(b["engine"], b["repetition"], b["attempt"], b["stage"], len(b["cells"])) for b in blocks],
+            [("vllm", 1, 2, "rerun", 2), (cells[30].engine, 2, 1, "formal", 1)],
+        )
+        self.assertEqual(blocks[0]["replacement_for"], {
+            cells[0].key: "runs/vllm/r1/a1-old/cells/one", cells[1].key: "runs/vllm/r1/a1-old/cells/two",
+        })
+        for bad in (
+            [{**eligible[0], "replacement_for": None}], [{**eligible[1], "replacement_for": "x"}],
+            [eligible[0], eligible[0]], [{**eligible[0], "profile": "unscheduled"}],
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                plan_blocks(self.config, phase="measurement", eligible=bad)
+        with self.assertRaises(ValueError):
+            plan_blocks(self.config, phase="pilot", eligible=[])
+
+    def test_cli_previews_blocks_and_requires_explicit_settlement(self):
+        from inference_bench.__main__ import main
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main([
+                "blocks", "--phase", "pilot", "--lease-seconds", "2400",
+                "--config", str(ROOT / "configs/benchmark.toml"),
+            ]), 0)
+        stages = json.loads(output.getvalue())["stages"]
+        self.assertEqual(stages["pilot"], {"blocks": 2, "worst_case_seconds": 6000, "allowance_seconds": 6000})
+        lease = self.ledger.reserve("pilot", 100, now=self.clock())
+        arguments = [
+            "settle", "--config", str(ROOT / "configs/benchmark.toml"), "--ledger", str(self.ledger.path),
+            "--reservation", lease["id"], "--charged-seconds", "40",
+        ]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(arguments), 2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main([*arguments, "--confirmed-stopped"]), 0)
+        self.assertEqual(self.ledger.summary()["exposure_seconds"], 40)
+
+
+class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        from inference_bench.artifacts import create_campaign
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = load_config(ROOT / "configs/benchmark.toml")
+        self.campaign = create_campaign(
+            self.root / "campaign", self.config, read_json(ROOT / "configs/sources.lock.json"),
+            read_json(ROOT / "configs/engines.lock.json"), campaign_id="worker-test",
+            evidence_kind="synthetic", harness={"note": "test fixture"},
+        )
+        self.ledger = Ledger(self.root / "ledger.json", self.config)
+        self.cell = self.config.cells()[0]
+        self.prompts = probe_prompts() + [
+            {"profile": self.cell.profile, "repetition": self.cell.repetition, "phase": phase,
+             "request_id": f"{phase}-{i}"}
+            for phase, count in (("measurement", 256), ("warmup", 64)) for i in range(count)
+        ]
+
+    def payload(self, *, attempt=1, lease=300, queue=60):
+        from inference_bench.controller import block_payload
+        original = "runs/vllm/r1/a1-old/cells/x" if attempt == 2 else None
+        block = {
+            "phase": "measurement", "engine": self.cell.engine, "repetition": self.cell.repetition,
+            "attempt": attempt, "stage": "formal" if attempt == 1 else "rerun",
+            "cells": [self.cell.to_dict()], "replacement_for": {self.cell.key: original} if original else {},
+        }
+        reservation = self.ledger.reserve(block["stage"], lease + queue)
+        # The payload needs only the lease identity; release the test ledger for the next case.
+        self.ledger.settle(reservation["id"], 0, confirmed_stopped=True)
+        return block_payload(block, campaign=self.campaign, config=self.config, reservation=reservation, lease_s=lease)
+
+    def run_worker(self, payload):
+        from inference_bench.runner import run_worker
+        return run_worker(payload, results_root=self.root / "results", model_path="/unused", prompts=self.prompts)
+
+    def test_worker_runs_a_replacement_block_and_reports_its_timing(self):
+        payload = self.payload(attempt=2)
+        patches, calls = fake_engine(self)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            result = self.run_worker(payload)
+        self.assertEqual(result["status"], "complete")
+        self.assertLessEqual(result["started_unix"], result["finished_unix"])
+        self.assertEqual(len(calls), 2)
+        block = self.root / "results" / payload["directory"]
+        verify(block)
+        cell = read_json(next(block.glob("cells/*/manifest.json")))
+        self.assertEqual((cell["attempt"], cell["replacement_for"]), (2, "runs/vllm/r1/a1-old/cells/x"))
+        self.assertEqual(read_json(block / "manifest.json")["reservation_id"], payload["context"]["reservation_id"])
+
+    def test_worker_rejects_mismatched_payloads_queue_exhaustion_and_unlinked_replacements(self):
+        payload = self.payload()
+        changed_seed = {**self.config.data, "experiment": {**self.config.data["experiment"], "seed": 1}}
+        other = {**payload["context"], "reservation_id": "0" * 32}
+        for change in (
+            {"directory": "../escape"}, {"directory": payload["directory"].replace("/r1/", "/r2/")},
+            {"context": other}, {"context": {**payload["context"], "attempt": 3}},
+            {"config": changed_seed}, {"schema_version": 2},
+        ):
+            with self.subTest(change=sorted(change)), self.assertRaises(ValueError):
+                self.run_worker({**payload, **change})
+        late = {**payload, "minimum_start_s": payload["deadline_unix"] - time.time() + 100}
+        with patch("inference_bench.runner.engines.inspect_hardware") as probe:
+            result = self.run_worker(late)
+            probe.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Queueing", result["error"])
+        self.assertFalse((self.root / "results" / payload["directory"]).exists())
+        result = self.run_worker({**self.payload(attempt=2), "cell_context": {}})
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("replacement", result["error"])
+
+
 class BlockTests(unittest.IsolatedAsyncioTestCase):
     def fake_engine(self, broken=None):
-        @asynccontextmanager
-        async def fake_client(*args):
-            yield object()
-
-        cells = []
-
-        async def fake_run_cell(origin, prompts, **kwargs):
-            if kwargs["phase"] == "conformance":
-                self.assertEqual(kwargs["ignore_eos"], kwargs["stop_token_ids"] is None)
-                return probe_result(prompts[0], broken=broken, **kwargs)
-            cells.append((prompts, kwargs))
-            return {
-                "records": [], "events": [], "summary": {"valid": True},
-                "client_loop_lag_ms": [], "client_lag_interval_ms": 10,
-            }
-
-        patches = (
-            patch("inference_bench.runner.engines.inspect_hardware", return_value=[]),
-            patch("inference_bench.runner.ProcessGroup"),
-            patch("inference_bench.runner.http_client", fake_client),
-            patch("inference_bench.runner.wait_ready", new_callable=AsyncMock,
-                  return_value={"data": [{"id": "gemma4-bench"}]}),
-            patch("inference_bench.runner._sample_gpu", new_callable=AsyncMock),
-            patch("inference_bench.runner.run_cell", fake_run_cell),
-        )
-        return patches, cells
+        return fake_engine(self, broken)
 
     async def test_pilot_uses_separate_inputs_and_records_block_timings_without_network(self):
         config = load_config(ROOT / "configs/benchmark.toml")
