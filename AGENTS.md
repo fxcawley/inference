@@ -2,6 +2,7 @@
 
 ## Starting point
 
+- When continuing on a new machine, read `docs/handoff.md` first; it lists the current state and the remaining steps in order.
 - Read `README.md` and `docs/megaplan.md` before implementation.
 - The local harness and offline analysis are implemented. Read `docs/runbook.md` for verified capabilities and remaining integration work; the complete megaplan still includes future steps.
 - Follow the user's requested work package. Publishing this plan does not by itself request running the paid GPU campaign.

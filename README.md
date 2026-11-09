@@ -8,6 +8,8 @@ Read the **[full megaplan](docs/megaplan.md)** for the experiment design, implem
 
 ## Continue on another machine
 
+Start with the **[handoff](docs/handoff.md)**: current state, setup, budget rules, and the remaining steps in order.
+
 ```bash
 git clone https://github.com/fxcawley/inference.git
 cd inference
