@@ -22,6 +22,7 @@ htmlcov/
 !.env.example
 .modal.toml
 secrets/
+private/
 *.pem
 *.key
 
